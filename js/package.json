@@ -1,0 +1,10 @@
+{
+  "name": "mathjax-bundle",
+  "private": true,
+  "dependencies": {
+    "mathjax-full": "3.2.2"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}

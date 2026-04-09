@@ -1,0 +1,4 @@
+/target
+output*.svg
+output*.png
+js/node_modules
