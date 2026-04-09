@@ -1,7 +1,12 @@
 {
   "name": "mathjax-bundle",
   "private": true,
+  "scripts": {
+    "build:g2": "esbuild g2-probe.mjs --bundle --format=iife --platform=browser --target=es2020 --alias:path=./shims/path.js --alias:fs=./shims/fs.js --outfile=g2-bundle.js"
+  },
   "dependencies": {
+    "@antv/g-canvaskit": "^1.1.1",
+    "@antv/g2": "^5.4.8",
     "mathjax-full": "3.2.2"
   },
   "devDependencies": {

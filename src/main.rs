@@ -1,27 +1,45 @@
-use katextest::MathRenderer;
-use std::fs;
+use std::{fs, path::PathBuf};
+
+use katextest::{render_scene_to_png, scene_from_json, G2Probe};
 
 fn main() {
-    let renderer = MathRenderer::new().expect("Failed to initialize MathRenderer");
+    std::thread::Builder::new()
+        .name("g2-probe".into())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(run_probe)
+        .expect("Failed to spawn probe thread")
+        .join()
+        .expect("Probe thread panicked");
+}
 
-    let latex = r"E = mc^2";
-    println!("Input LaTeX: {latex}");
+fn run_probe() {
+    let probe = G2Probe::new().expect("Failed to initialize G2Probe");
+    let report = probe
+        .run_sample_chart()
+        .expect("Failed to execute G2 probe");
 
-    let svg = renderer.tex_to_svg(latex, true).expect("Failed to convert to SVG");
-    fs::write("output.svg", &svg).expect("Failed to write SVG");
-    println!("SVG saved to output.svg ({} bytes)", svg.len());
+    println!("G2 probe ok: {}", report.ok);
+    if let Some(result_json) = report.result_json.as_deref() {
+        println!("Result: {result_json}");
+        let artifacts = PathBuf::from("artifacts");
+        fs::create_dir_all(&artifacts).expect("Failed to create artifacts directory");
 
-    let png = renderer.tex_to_png(latex, true, 3.0).expect("Failed to render PNG");
-    fs::write("output.png", &png).expect("Failed to write PNG");
-    println!("PNG saved to output.png ({} bytes)", png.len());
+        let command_path = artifacts.join("g2-commands.json");
+        fs::write(&command_path, result_json).expect("Failed to write commands JSON");
+        println!("Commands JSON: {}", command_path.display());
 
-    let frac = r"\frac{1}{2}";
-    let svg2 = renderer.tex_to_svg(frac, true).unwrap();
-    fs::write("output_frac.svg", &svg2).unwrap();
-    println!("Fraction SVG saved ({} bytes)", svg2.len());
+        let scene = scene_from_json(result_json).expect("Failed to parse G2 scene JSON");
+        let png = render_scene_to_png(&scene).expect("Failed to render G2 scene with skia-safe");
+        let png_path = artifacts.join("g2-frame.png");
+        fs::write(&png_path, png).expect("Failed to write G2 PNG");
+        println!("PNG: {}", png_path.display());
+    }
+    if let Some(error) = report.error.as_deref() {
+        println!("Error: {error}");
+    }
 
-    let integral = r"\int_0^\infty e^{-x^2} dx = \frac{\sqrt{\pi}}{2}";
-    let svg3 = renderer.tex_to_svg(integral, true).unwrap();
-    fs::write("output_integral.svg", &svg3).unwrap();
-    println!("Integral SVG saved ({} bytes)", svg3.len());
+    println!("Logs:");
+    for log in report.logs {
+        println!("[{}] {}", log.level, log.message);
+    }
 }

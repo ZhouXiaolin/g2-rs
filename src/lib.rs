@@ -4,6 +4,14 @@ use rquickjs::{Context, FromJs, Runtime};
 
 const MATHJAX_BUNDLE: &str = include_str!("../js/mathjax-bundle.js");
 
+mod g2;
+mod g2_canvas;
+
+pub use g2::{G2Probe, G2ProbeError, G2ProbeReport, ProbeLog};
+pub use g2_canvas::{
+    render_scene_to_png, scene_from_json, G2CanvasCommand, G2ReplayError, G2Scene, G2ScenePayload,
+};
+
 pub struct MathRenderer {
     #[allow(dead_code)]
     runtime: Runtime,
