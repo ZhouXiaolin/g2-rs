@@ -165,24 +165,247 @@ function snapshotPathEffect(pathEffect) {
 
 function snapshotPath(path) {
   if (!path || typeof path !== "object") return [];
-  return Array.isArray(path.ops)
-    ? path.ops.map((op) => op.map((value, index) => (index === 0 ? value : finiteNumber(value))))
-    : [];
+  return Array.isArray(path.ops) ? path.ops.map((op) => op.map(snapshotPathValue)) : [];
+}
+
+function approxEqual(a, b, epsilon = 0.01) {
+  return Math.abs(finiteNumber(a) - finiteNumber(b)) <= epsilon;
+}
+
+function parseTranslateMatrix(matrix) {
+  if (!Array.isArray(matrix)) return null;
+  if (
+    matrix.length >= 6 &&
+    approxEqual(matrix[0], 1) &&
+    approxEqual(matrix[1], 0) &&
+    approxEqual(matrix[2], 0) &&
+    approxEqual(matrix[3], 1)
+  ) {
+    return {
+      tx: finiteNumber(matrix[4]),
+      ty: finiteNumber(matrix[5]),
+    };
+  }
+
+  if (
+    matrix.length >= 9 &&
+    approxEqual(matrix[0], 1) &&
+    approxEqual(matrix[1], 0) &&
+    approxEqual(matrix[3], 0) &&
+    approxEqual(matrix[4], 1) &&
+    approxEqual(matrix[6], 0) &&
+    approxEqual(matrix[7], 0) &&
+    approxEqual(matrix[8], 1)
+  ) {
+    return {
+      tx: finiteNumber(matrix[2]),
+      ty: finiteNumber(matrix[5]),
+    };
+  }
+
+  return null;
+}
+
+function getPathBounds(ops) {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+
+  const visitPoint = (x, y) => {
+    const px = finiteOptionalNumber(x);
+    const py = finiteOptionalNumber(y);
+    if (px === null || py === null) return;
+    minX = Math.min(minX, px);
+    minY = Math.min(minY, py);
+    maxX = Math.max(maxX, px);
+    maxY = Math.max(maxY, py);
+  };
+
+  for (const op of ops || []) {
+    const verb = op?.[0];
+    switch (verb) {
+      case "moveTo":
+      case "lineTo":
+        visitPoint(op[1], op[2]);
+        break;
+      case "quadTo":
+        visitPoint(op[1], op[2]);
+        visitPoint(op[3], op[4]);
+        break;
+      case "cubicTo":
+        visitPoint(op[1], op[2]);
+        visitPoint(op[3], op[4]);
+        visitPoint(op[5], op[6]);
+        break;
+      case "arcToRotated":
+        visitPoint(op[6], op[7]);
+        break;
+      case "addPoly":
+        for (const point of Array.isArray(op[1]) ? op[1] : []) {
+          visitPoint(point?.[0], point?.[1]);
+        }
+        break;
+      case "addRRect": {
+        const rect = op[1]?.rect;
+        if (Array.isArray(rect) && rect.length >= 4) {
+          visitPoint(rect[0], rect[1]);
+          visitPoint(rect[2], rect[3]);
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  if (!Number.isFinite(minX) || !Number.isFinite(minY)) return null;
+  return { minX, minY, maxX, maxY };
+}
+
+function shouldSkipDuplicatePathTranslate(ops, matrix) {
+  const translate = parseTranslateMatrix(matrix);
+  if (!translate) return false;
+
+  const bounds = getPathBounds(ops);
+  if (!bounds) return false;
+
+  const hasAbsoluteOffset =
+    Math.abs(bounds.minX) > 0.01 || Math.abs(bounds.minY) > 0.01;
+
+  return (
+    hasAbsoluteOffset &&
+    approxEqual(bounds.minX, translate.tx) &&
+    approxEqual(bounds.minY, translate.ty)
+  );
 }
 
 function snapshotParagraph(paragraph, x, y) {
   if (!paragraph || typeof paragraph !== "object") return null;
-  const style = paragraph.style || {};
+  const textStyle = paragraph.textStyle || {};
+  const paragraphStyle = paragraph.paragraphStyle || {};
+  const sourceLayout = paragraph.sourceLayout || {};
+  const maxWidth = finiteNumber(paragraph.getMaxWidth(), finiteNumber(paragraph.width, 0));
+  const height = finiteNumber(paragraph.getHeight(), finiteNumber(textStyle.fontSize, 12));
+  const textAlign = paragraphStyle.textAlign || textStyle.textAlign || "left";
   return {
     text: String(paragraph.text || ""),
     width: finiteNumber(paragraph.width, 0),
-    x: finiteNumber(x, 0),
-    y: finiteNumber(y, 0),
-    fontSize: finiteNumber(style.fontSize, 12),
-    color: normalizeColor(style.color),
-    textAlign: style.textAlign || "left",
-    fontFamilies: Array.isArray(style.fontFamilies) ? style.fontFamilies.map(String) : [],
+    x:
+      finiteOptionalNumber(x) ??
+      computeParagraphX(textAlign, maxWidth, sourceLayout),
+    y:
+      finiteOptionalNumber(y) ??
+      computeParagraphY(sourceLayout.textBaseline, height, sourceLayout),
+    fontSize: finiteNumber(textStyle.fontSize, 12),
+    color: normalizeColor(textStyle.color),
+    textAlign,
+    textDirection: paragraphStyle.textDirection || "ltr",
+    maxLines: finiteOptionalNumber(paragraphStyle.maxLines),
+    ellipsis:
+      typeof paragraphStyle.ellipsis === "string" ? paragraphStyle.ellipsis : null,
+    fontFamilies: Array.isArray(textStyle.fontFamilies)
+      ? textStyle.fontFamilies.map(String)
+      : [],
   };
+}
+
+function snapshotPathValue(value) {
+  if (typeof value === "string" || typeof value === "boolean") return value;
+  if (typeof value === "number") return finiteNumber(value, 0);
+  if (Array.isArray(value)) return value.map(snapshotPathValue);
+  if (!value || typeof value !== "object") return null;
+
+  const out = {};
+  for (const [key, item] of Object.entries(value)) {
+    out[key] = snapshotPathValue(item);
+  }
+  return out;
+}
+
+function computeParagraphX(textAlign, maxWidth, sourceLayout) {
+  let x = finiteNumber(sourceLayout.x, 0) + finiteNumber(sourceLayout.dx, 0);
+  if (textAlign === "center" || textAlign === "middle") {
+    x -= maxWidth / 2;
+  } else if (textAlign === "right" || textAlign === "end") {
+    x -= maxWidth;
+  }
+  return x;
+}
+
+function computeParagraphY(textBaseline, height, sourceLayout) {
+  let y = finiteNumber(sourceLayout.y, 0) + finiteNumber(sourceLayout.dy, 0);
+  if (textBaseline === "middle") {
+    y -= height / 2;
+  } else if (
+    textBaseline === "bottom" ||
+    textBaseline === "alphabetic" ||
+    textBaseline === "ideographic"
+  ) {
+    y -= height;
+  }
+  return y;
+}
+
+function getTextMeasureContext() {
+  if (globalThis.__fakeCanvasKitMeasureContext) {
+    return globalThis.__fakeCanvasKitMeasureContext;
+  }
+
+  const canvas =
+    typeof document !== "undefined" && document?.createElement
+      ? document.createElement("canvas")
+      : null;
+  const context = canvas?.getContext?.("2d") || null;
+  globalThis.__fakeCanvasKitMeasureContext = context;
+  return context;
+}
+
+function buildTextMeasureFont(textStyle) {
+  const fontSize = finiteNumber(textStyle?.fontSize, 12);
+  const fontFamilies = Array.isArray(textStyle?.fontFamilies) && textStyle.fontFamilies.length > 0
+    ? textStyle.fontFamilies.join(", ")
+    : "sans-serif";
+  const weight = textStyle?.fontStyle?.weight?.value ?? textStyle?.fontWeight ?? "normal";
+  return `${weight} ${fontSize}px ${fontFamilies}`;
+}
+
+function measureParagraph(text, textStyle, paragraphStyle, width) {
+  const context = getTextMeasureContext();
+  const fontSize = finiteNumber(textStyle?.fontSize, 12);
+  const lineHeight = fontSize;
+  const measuredText = String(text || "");
+  let measuredWidth = measuredText.length * fontSize * 0.6;
+  let ascent = fontSize * 0.8;
+  let descent = fontSize * 0.2;
+
+  if (context) {
+    context.font = buildTextMeasureFont(textStyle);
+    const metrics = context.measureText(measuredText);
+    measuredWidth = finiteNumber(metrics?.width, measuredWidth);
+    ascent = finiteNumber(metrics?.actualBoundingBoxAscent, ascent);
+    descent = finiteNumber(metrics?.actualBoundingBoxDescent, descent);
+  }
+
+  const layoutWidth = finiteOptionalNumber(width);
+  const maxLines = finiteOptionalNumber(paragraphStyle?.maxLines);
+  let lines = 1;
+  let maxWidth = measuredWidth;
+
+  if (layoutWidth !== null && layoutWidth > 0) {
+    if (maxLines === 1) {
+      maxWidth = layoutWidth;
+    } else if (measuredWidth > layoutWidth) {
+      lines = Math.max(1, Math.ceil(measuredWidth / layoutWidth));
+      if (maxLines !== null && maxLines > 0) {
+        lines = Math.min(lines, maxLines);
+      }
+      maxWidth = layoutWidth;
+    }
+  }
+
+  const height = (ascent + descent || lineHeight) * lines;
+  return { maxWidth, height };
 }
 
 function serializeArg(value, depth = 0, seen = new WeakSet()) {
@@ -298,7 +521,15 @@ class FakePath {
   }
 
   transform(matrix) {
-    return this._push("transform", [matrix]);
+    record("Path.transform", [matrix]);
+    if (shouldSkipDuplicatePathTranslate(this.ops, matrix)) {
+      hostLog("debug", "Path.transform:skip-duplicate-translate", {
+        matrix,
+      });
+      return this;
+    }
+    this.ops.push(["transform", matrix]);
+    return this;
   }
 
   copy() {
@@ -412,27 +643,39 @@ class FakeParagraphStyle {
 }
 
 class FakeParagraph {
-  constructor(text, style) {
+  constructor(text, paragraphStyle, textStyle, sourceLayout) {
     defineFake(this, "Paragraph");
     this.text = text || "";
     this.width = 0;
-    this.style = style || {};
-    record("new Paragraph", [text, style]);
+    this.paragraphStyle = paragraphStyle || {};
+    this.textStyle = textStyle || {};
+    this.sourceLayout = sourceLayout || {};
+    this.metrics = measureParagraph(this.text, this.textStyle, this.paragraphStyle, 0);
+    record("new Paragraph", [text, paragraphStyle, textStyle, sourceLayout]);
   }
 
   layout(width) {
     this.width = Number(width) || 0;
+    this.metrics = measureParagraph(
+      this.text,
+      this.textStyle,
+      this.paragraphStyle,
+      this.width,
+    );
     record("Paragraph.layout", [width]);
   }
 
   getHeight() {
     record("Paragraph.getHeight", []);
-    return 14;
+    return finiteNumber(this.metrics?.height, finiteNumber(this.textStyle?.fontSize, 12));
   }
 
   getMaxWidth() {
     record("Paragraph.getMaxWidth", []);
-    return this.width || Math.max(1, this.text.length * 8);
+    return finiteNumber(
+      this.metrics?.maxWidth,
+      this.width || Math.max(1, this.text.length * 8),
+    );
   }
 
   delete() {
@@ -446,7 +689,9 @@ class FakeParagraphBuilder {
     this.style = style;
     this.fontMgr = fontMgr;
     this.parts = [];
-    this.currentStyle = { ...(style?.style?.textStyle || {}) };
+    this.paragraphStyle = { ...(style?.style || {}) };
+    this.styleStack = [{ ...(style?.style?.textStyle || {}) }];
+    this.sourceLayout = { ...(globalThis.__fakeCanvasKitTextLayoutContext || {}) };
     record("new ParagraphBuilder", [style, fontMgr]);
   }
 
@@ -457,22 +702,32 @@ class FakeParagraphBuilder {
   }
 
   pushStyle(style) {
-    this.currentStyle = {
-      ...this.currentStyle,
+    const currentStyle = this.styleStack[this.styleStack.length - 1] || {};
+    this.styleStack.push({
+      ...currentStyle,
       ...(style || {}),
-    };
+    });
     record("ParagraphBuilder.pushStyle", [style]);
     return this;
   }
 
   pop() {
     record("ParagraphBuilder.pop", []);
+    if (this.styleStack.length > 1) {
+      this.styleStack.pop();
+    }
     return this;
   }
 
   build() {
     record("ParagraphBuilder.build", []);
-    return new FakeParagraph(this.parts.join(""), this.currentStyle);
+    const currentStyle = this.styleStack[this.styleStack.length - 1] || {};
+    return new FakeParagraph(
+      this.parts.join(""),
+      this.paragraphStyle,
+      currentStyle,
+      this.sourceLayout,
+    );
   }
 
   delete() {

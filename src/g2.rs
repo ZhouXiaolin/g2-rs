@@ -5,6 +5,9 @@ use std::{
 };
 
 use rquickjs::{promise::MaybePromise, Context, FromJs, Function, Runtime};
+use serde::Serialize;
+use skia_safe::font_style::{Slant, Weight, Width};
+use skia_safe::{Font, FontMgr, FontStyle};
 
 const G2_HOST_RUNTIME: &str = include_str!("g2_host_runtime.js");
 
@@ -180,6 +183,36 @@ fn install_logger<'js>(
             .map_err(|e| G2ProbeError::Js(e.to_string()))?,
         )
         .map_err(|e| G2ProbeError::Js(e.to_string()))?;
+    globals
+        .set(
+            "__rust_fetch_text",
+            Function::new(ctx.clone(), move |url: String| {
+                fetch_text(&url).map_err(|error| {
+                    rquickjs::Error::new_from_js_message("rustFetch", "string", error)
+                })
+            })
+            .map_err(|e| G2ProbeError::Js(e.to_string()))?,
+        )
+        .map_err(|e| G2ProbeError::Js(e.to_string()))?;
+    globals
+        .set(
+            "__rust_measure_text",
+            Function::new(
+                ctx.clone(),
+                move |text: String, font_size: f32, font_families: String, font_weight: i32, italic: bool| {
+                    measure_text_json(&text, font_size, &font_families, font_weight, italic)
+                        .map_err(|error| {
+                            rquickjs::Error::new_from_js_message(
+                                "rustMeasureText",
+                                "string",
+                                error,
+                            )
+                        })
+                },
+            )
+            .map_err(|e| G2ProbeError::Js(e.to_string()))?,
+        )
+        .map_err(|e| G2ProbeError::Js(e.to_string()))?;
     Ok(())
 }
 
@@ -196,4 +229,88 @@ fn g2_bundle_path() -> PathBuf {
 
 fn eval_string(ctx: &rquickjs::Ctx<'_>, script: &str) -> Option<String> {
     ctx.eval::<String, _>(script).ok()
+}
+
+fn fetch_text(url: &str) -> Result<String, String> {
+    let response = ureq::get(url)
+        .call()
+        .map_err(|error| format!("fetch failed for {url}: {error}"))?;
+    response
+        .into_string()
+        .map_err(|error| format!("failed to read response body for {url}: {error}"))
+}
+
+#[derive(Serialize)]
+struct TextMeasure {
+    width: f32,
+    #[serde(rename = "actualBoundingBoxAscent")]
+    actual_bounding_box_ascent: f32,
+    #[serde(rename = "actualBoundingBoxDescent")]
+    actual_bounding_box_descent: f32,
+    #[serde(rename = "fontBoundingBoxAscent")]
+    font_bounding_box_ascent: f32,
+    #[serde(rename = "fontBoundingBoxDescent")]
+    font_bounding_box_descent: f32,
+}
+
+fn measure_text_json(
+    text: &str,
+    font_size: f32,
+    font_families: &str,
+    font_weight: i32,
+    italic: bool,
+) -> Result<String, String> {
+    let metrics = measure_text(text, font_size, font_families, font_weight, italic);
+    serde_json::to_string(&metrics).map_err(|error| error.to_string())
+}
+
+fn measure_text(
+    text: &str,
+    font_size: f32,
+    font_families: &str,
+    font_weight: i32,
+    italic: bool,
+) -> TextMeasure {
+    let font_size = font_size.max(1.0);
+    let style = FontStyle::new(
+        Weight::from(font_weight.clamp(*Weight::THIN, *Weight::EXTRA_BLACK)),
+        Width::NORMAL,
+        if italic { Slant::Italic } else { Slant::Upright },
+    );
+
+    let font_mgr = FontMgr::default();
+    let typeface = pick_typeface(&font_mgr, font_families, style)
+        .or_else(|| font_mgr.legacy_make_typeface(None, style));
+    let mut font = match typeface {
+        Some(typeface) => Font::new(typeface, font_size),
+        None => Font::default(),
+    };
+    font.set_size(font_size);
+
+    let (width, bounds) = font.measure_str(text, None);
+    let (_, metrics) = font.metrics();
+
+    TextMeasure {
+        width: width.max(0.0),
+        actual_bounding_box_ascent: (-bounds.top).max(0.0),
+        actual_bounding_box_descent: bounds.bottom.max(0.0),
+        font_bounding_box_ascent: (-metrics.ascent).max(0.0),
+        font_bounding_box_descent: metrics.descent.max(0.0),
+    }
+}
+
+fn pick_typeface(font_mgr: &FontMgr, font_families: &str, style: FontStyle) -> Option<skia_safe::Typeface> {
+    for family in font_families.split(',') {
+        let family = family.trim().trim_matches('"').trim_matches('\'');
+        if family.is_empty() {
+            continue;
+        }
+        if let Some(typeface) = font_mgr.match_family_style(family, style) {
+            return Some(typeface);
+        }
+        if let Some(typeface) = font_mgr.legacy_make_typeface(Some(family), style) {
+            return Some(typeface);
+        }
+    }
+    None
 }

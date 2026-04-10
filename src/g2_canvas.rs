@@ -1,8 +1,8 @@
 use serde::Deserialize;
 use serde_json::Value;
 use skia_safe::{
-    paint, surfaces, Color, EncodedImageFormat, FontMgr, Matrix, Paint, PathBuilder, PathEffect,
-    Point, RRect, Rect,
+    paint, path_builder, surfaces, Color, EncodedImageFormat, FontMgr, Matrix, Paint,
+    PathBuilder, PathDirection, PathEffect, Point, RRect, Rect,
 };
 use skia_safe::textlayout::{FontCollection, ParagraphBuilder, ParagraphStyle, TextAlign, TextDirection, TextStyle};
 
@@ -161,6 +161,14 @@ pub enum G2CanvasCommand {
         #[serde(default = "default_text_align")]
         #[serde(rename = "textAlign")]
         text_align: String,
+        #[serde(default = "default_text_direction")]
+        #[serde(rename = "textDirection")]
+        text_direction: String,
+        #[serde(default)]
+        #[serde(rename = "maxLines")]
+        max_lines: Option<usize>,
+        #[serde(default)]
+        ellipsis: Option<String>,
         #[serde(default)]
         #[serde(rename = "fontFamilies")]
         font_families: Vec<String>,
@@ -254,11 +262,7 @@ fn replay_command(
             canvas.scale((*x, *y));
         }
         G2CanvasCommand::Concat { matrix } => {
-            if matrix.len() >= 9 {
-                let matrix = Matrix::new_all(
-                    matrix[0], matrix[1], matrix[2], matrix[3], matrix[4], matrix[5], matrix[6],
-                    matrix[7], matrix[8],
-                );
+            if let Some(matrix) = matrix_from_slice(matrix) {
                 canvas.concat(&matrix);
             }
         }
@@ -326,6 +330,9 @@ fn replay_command(
             font_size,
             color,
             text_align,
+            text_direction,
+            max_lines,
+            ellipsis,
             font_families,
         } => {
             text.draw(
@@ -337,6 +344,9 @@ fn replay_command(
                 *font_size,
                 *color,
                 text_align,
+                text_direction,
+                *max_lines,
+                ellipsis.as_deref(),
                 font_families,
             )?;
         }
@@ -446,6 +456,38 @@ fn build_path(ops: &[Vec<Value>]) -> Option<skia_safe::Path> {
                 (value_at(op, 5), value_at(op, 6)),
                 );
             }
+            "arcToRotated" => {
+                builder.arc_to_radius(
+                    (value_at(op, 1), value_at(op, 2)),
+                    value_at(op, 3),
+                    if bool_at(op, 4) {
+                        path_builder::ArcSize::Small
+                    } else {
+                        path_builder::ArcSize::Large
+                    },
+                    if bool_at(op, 5) {
+                        PathDirection::CCW
+                    } else {
+                        PathDirection::CW
+                    },
+                    (value_at(op, 6), value_at(op, 7)),
+                );
+            }
+            "addPoly" => {
+                if let Some(points) = points_at(op, 1) {
+                    builder.add_polygon(&points, bool_at(op, 2));
+                }
+            }
+            "addRRect" => {
+                if let Some(rrect) = rrect_at(op, 1) {
+                    builder.add_rrect(&rrect, None, None);
+                }
+            }
+            "transform" => {
+                if let Some(matrix) = value_at_matrix(op, 1) {
+                    builder.transform(&matrix);
+                }
+            }
             "close" => {
                 builder.close();
             }
@@ -463,11 +505,67 @@ fn value_at(op: &[Value], index: usize) -> f32 {
         .unwrap_or(0.0)
 }
 
+fn bool_at(op: &[Value], index: usize) -> bool {
+    op.get(index).and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn points_at(op: &[Value], index: usize) -> Option<Vec<Point>> {
+    let values = op.get(index)?.as_array()?;
+    let mut points = Vec::with_capacity(values.len());
+    for value in values {
+        let xy = value.as_array()?;
+        let x = xy.first().and_then(Value::as_f64)? as f32;
+        let y = xy.get(1).and_then(Value::as_f64)? as f32;
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        points.push(Point::new(x, y));
+    }
+    Some(points)
+}
+
+fn rrect_at(op: &[Value], index: usize) -> Option<RRect> {
+    let value = op.get(index)?.as_object()?;
+    let rect = to_rect_value(value.get("rect")?)?;
+    let rx = value
+        .get("rx")
+        .and_then(Value::as_f64)
+        .map(|value| value as f32)
+        .filter(|value| value.is_finite())
+        .unwrap_or_default()
+        .abs();
+    let ry = value
+        .get("ry")
+        .and_then(Value::as_f64)
+        .map(|value| value as f32)
+        .filter(|value| value.is_finite())
+        .unwrap_or_default()
+        .abs();
+    Some(RRect::new_rect_xy(rect, rx, ry))
+}
+
+fn value_at_matrix(op: &[Value], index: usize) -> Option<Matrix> {
+    matrix_from_value(op.get(index)?)
+}
+
 fn to_rect(values: &[f32]) -> Option<Rect> {
     if values.len() < 4 {
         return None;
     }
     Some(Rect::from_ltrb(values[0], values[1], values[2], values[3]))
+}
+
+fn to_rect_value(value: &Value) -> Option<Rect> {
+    let values = value.as_array()?;
+    if values.len() < 4 {
+        return None;
+    }
+    Some(Rect::from_ltrb(
+        values[0].as_f64()? as f32,
+        values[1].as_f64()? as f32,
+        values[2].as_f64()? as f32,
+        values[3].as_f64()? as f32,
+    ))
 }
 
 fn to_rrect(values: &[f32]) -> Option<RRect> {
@@ -501,6 +599,29 @@ fn normalized_color(color: [f32; 4]) -> [f32; 4] {
     ]
 }
 
+fn matrix_from_slice(values: &[f32]) -> Option<Matrix> {
+    match values {
+        [a, b, c, d, e, f] => Some(Matrix::new_all(*a, *c, *e, *b, *d, *f, 0.0, 0.0, 1.0)),
+        [a, b, c, d, e, f, g, h, i, ..] => {
+            Some(Matrix::new_all(*a, *b, *c, *d, *e, *f, *g, *h, *i))
+        }
+        _ => None,
+    }
+}
+
+fn matrix_from_value(value: &Value) -> Option<Matrix> {
+    let array = value.as_array()?;
+    let values: Vec<f32> = array
+        .iter()
+        .filter_map(|value| value.as_f64())
+        .map(|value| value as f32)
+        .collect();
+    if values.len() != array.len() {
+        return None;
+    }
+    matrix_from_slice(&values)
+}
+
 struct TextRenderer;
 
 impl TextRenderer {
@@ -518,6 +639,9 @@ impl TextRenderer {
         font_size: f32,
         color: [f32; 4],
         text_align: &str,
+        text_direction: &str,
+        max_lines: Option<usize>,
+        ellipsis: Option<&str>,
         font_families: &[String],
     ) -> Result<(), G2ReplayError> {
         if text.is_empty() {
@@ -536,12 +660,21 @@ impl TextRenderer {
 
         let mut paragraph_style = ParagraphStyle::new();
         paragraph_style.set_text_style(&text_style);
-        paragraph_style.set_text_direction(TextDirection::LTR);
+        paragraph_style.set_text_direction(match text_direction {
+            "rtl" => TextDirection::RTL,
+            _ => TextDirection::LTR,
+        });
         paragraph_style.set_text_align(match text_align {
             "center" | "middle" => TextAlign::Center,
             "right" | "end" => TextAlign::Right,
             _ => TextAlign::Left,
         });
+        if let Some(max_lines) = max_lines.filter(|value| *value > 0) {
+            paragraph_style.set_max_lines(Some(max_lines));
+        }
+        if let Some(ellipsis) = ellipsis.filter(|value| !value.is_empty()) {
+            paragraph_style.set_ellipsis(ellipsis);
+        }
 
         let mut builder = ParagraphBuilder::new(&paragraph_style, font_collection);
         builder.push_style(&text_style);
@@ -563,4 +696,8 @@ fn default_font_size() -> f32 {
 
 fn default_text_align() -> String {
     "left".into()
+}
+
+fn default_text_direction() -> String {
+    "ltr".into()
 }

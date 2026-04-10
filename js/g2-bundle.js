@@ -85082,21 +85082,186 @@
   }
   function snapshotPath(path2) {
     if (!path2 || typeof path2 !== "object") return [];
-    return Array.isArray(path2.ops) ? path2.ops.map((op) => op.map((value2, index5) => index5 === 0 ? value2 : finiteNumber(value2))) : [];
+    return Array.isArray(path2.ops) ? path2.ops.map((op) => op.map(snapshotPathValue)) : [];
+  }
+  function approxEqual(a4, b, epsilon4 = 0.01) {
+    return Math.abs(finiteNumber(a4) - finiteNumber(b)) <= epsilon4;
+  }
+  function parseTranslateMatrix(matrix2) {
+    if (!Array.isArray(matrix2)) return null;
+    if (matrix2.length >= 6 && approxEqual(matrix2[0], 1) && approxEqual(matrix2[1], 0) && approxEqual(matrix2[2], 0) && approxEqual(matrix2[3], 1)) {
+      return {
+        tx: finiteNumber(matrix2[4]),
+        ty: finiteNumber(matrix2[5])
+      };
+    }
+    if (matrix2.length >= 9 && approxEqual(matrix2[0], 1) && approxEqual(matrix2[1], 0) && approxEqual(matrix2[3], 0) && approxEqual(matrix2[4], 1) && approxEqual(matrix2[6], 0) && approxEqual(matrix2[7], 0) && approxEqual(matrix2[8], 1)) {
+      return {
+        tx: finiteNumber(matrix2[2]),
+        ty: finiteNumber(matrix2[5])
+      };
+    }
+    return null;
+  }
+  function getPathBounds(ops) {
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY2 = -Infinity;
+    const visitPoint = (x4, y5) => {
+      const px2 = finiteOptionalNumber(x4);
+      const py = finiteOptionalNumber(y5);
+      if (px2 === null || py === null) return;
+      minX = Math.min(minX, px2);
+      minY = Math.min(minY, py);
+      maxX = Math.max(maxX, px2);
+      maxY2 = Math.max(maxY2, py);
+    };
+    for (const op of ops || []) {
+      const verb = op?.[0];
+      switch (verb) {
+        case "moveTo":
+        case "lineTo":
+          visitPoint(op[1], op[2]);
+          break;
+        case "quadTo":
+          visitPoint(op[1], op[2]);
+          visitPoint(op[3], op[4]);
+          break;
+        case "cubicTo":
+          visitPoint(op[1], op[2]);
+          visitPoint(op[3], op[4]);
+          visitPoint(op[5], op[6]);
+          break;
+        case "arcToRotated":
+          visitPoint(op[6], op[7]);
+          break;
+        case "addPoly":
+          for (const point6 of Array.isArray(op[1]) ? op[1] : []) {
+            visitPoint(point6?.[0], point6?.[1]);
+          }
+          break;
+        case "addRRect": {
+          const rect4 = op[1]?.rect;
+          if (Array.isArray(rect4) && rect4.length >= 4) {
+            visitPoint(rect4[0], rect4[1]);
+            visitPoint(rect4[2], rect4[3]);
+          }
+          break;
+        }
+        default:
+          break;
+      }
+    }
+    if (!Number.isFinite(minX) || !Number.isFinite(minY)) return null;
+    return { minX, minY, maxX, maxY: maxY2 };
+  }
+  function shouldSkipDuplicatePathTranslate(ops, matrix2) {
+    const translate5 = parseTranslateMatrix(matrix2);
+    if (!translate5) return false;
+    const bounds = getPathBounds(ops);
+    if (!bounds) return false;
+    const hasAbsoluteOffset = Math.abs(bounds.minX) > 0.01 || Math.abs(bounds.minY) > 0.01;
+    return hasAbsoluteOffset && approxEqual(bounds.minX, translate5.tx) && approxEqual(bounds.minY, translate5.ty);
   }
   function snapshotParagraph(paragraph, x4, y5) {
     if (!paragraph || typeof paragraph !== "object") return null;
-    const style = paragraph.style || {};
+    const textStyle = paragraph.textStyle || {};
+    const paragraphStyle = paragraph.paragraphStyle || {};
+    const sourceLayout = paragraph.sourceLayout || {};
+    const maxWidth = finiteNumber(paragraph.getMaxWidth(), finiteNumber(paragraph.width, 0));
+    const height = finiteNumber(paragraph.getHeight(), finiteNumber(textStyle.fontSize, 12));
+    const textAlign = paragraphStyle.textAlign || textStyle.textAlign || "left";
     return {
       text: String(paragraph.text || ""),
       width: finiteNumber(paragraph.width, 0),
-      x: finiteNumber(x4, 0),
-      y: finiteNumber(y5, 0),
-      fontSize: finiteNumber(style.fontSize, 12),
-      color: normalizeColor(style.color),
-      textAlign: style.textAlign || "left",
-      fontFamilies: Array.isArray(style.fontFamilies) ? style.fontFamilies.map(String) : []
+      x: finiteOptionalNumber(x4) ?? computeParagraphX(textAlign, maxWidth, sourceLayout),
+      y: finiteOptionalNumber(y5) ?? computeParagraphY(sourceLayout.textBaseline, height, sourceLayout),
+      fontSize: finiteNumber(textStyle.fontSize, 12),
+      color: normalizeColor(textStyle.color),
+      textAlign,
+      textDirection: paragraphStyle.textDirection || "ltr",
+      maxLines: finiteOptionalNumber(paragraphStyle.maxLines),
+      ellipsis: typeof paragraphStyle.ellipsis === "string" ? paragraphStyle.ellipsis : null,
+      fontFamilies: Array.isArray(textStyle.fontFamilies) ? textStyle.fontFamilies.map(String) : []
     };
+  }
+  function snapshotPathValue(value2) {
+    if (typeof value2 === "string" || typeof value2 === "boolean") return value2;
+    if (typeof value2 === "number") return finiteNumber(value2, 0);
+    if (Array.isArray(value2)) return value2.map(snapshotPathValue);
+    if (!value2 || typeof value2 !== "object") return null;
+    const out = {};
+    for (const [key, item] of Object.entries(value2)) {
+      out[key] = snapshotPathValue(item);
+    }
+    return out;
+  }
+  function computeParagraphX(textAlign, maxWidth, sourceLayout) {
+    let x4 = finiteNumber(sourceLayout.x, 0) + finiteNumber(sourceLayout.dx, 0);
+    if (textAlign === "center" || textAlign === "middle") {
+      x4 -= maxWidth / 2;
+    } else if (textAlign === "right" || textAlign === "end") {
+      x4 -= maxWidth;
+    }
+    return x4;
+  }
+  function computeParagraphY(textBaseline, height, sourceLayout) {
+    let y5 = finiteNumber(sourceLayout.y, 0) + finiteNumber(sourceLayout.dy, 0);
+    if (textBaseline === "middle") {
+      y5 -= height / 2;
+    } else if (textBaseline === "bottom" || textBaseline === "alphabetic" || textBaseline === "ideographic") {
+      y5 -= height;
+    }
+    return y5;
+  }
+  function getTextMeasureContext() {
+    if (globalThis.__fakeCanvasKitMeasureContext) {
+      return globalThis.__fakeCanvasKitMeasureContext;
+    }
+    const canvas = typeof document !== "undefined" && document?.createElement ? document.createElement("canvas") : null;
+    const context = canvas?.getContext?.("2d") || null;
+    globalThis.__fakeCanvasKitMeasureContext = context;
+    return context;
+  }
+  function buildTextMeasureFont(textStyle) {
+    const fontSize = finiteNumber(textStyle?.fontSize, 12);
+    const fontFamilies = Array.isArray(textStyle?.fontFamilies) && textStyle.fontFamilies.length > 0 ? textStyle.fontFamilies.join(", ") : "sans-serif";
+    const weight2 = textStyle?.fontStyle?.weight?.value ?? textStyle?.fontWeight ?? "normal";
+    return `${weight2} ${fontSize}px ${fontFamilies}`;
+  }
+  function measureParagraph(text, textStyle, paragraphStyle, width) {
+    const context = getTextMeasureContext();
+    const fontSize = finiteNumber(textStyle?.fontSize, 12);
+    const lineHeight = fontSize;
+    const measuredText = String(text || "");
+    let measuredWidth = measuredText.length * fontSize * 0.6;
+    let ascent = fontSize * 0.8;
+    let descent = fontSize * 0.2;
+    if (context) {
+      context.font = buildTextMeasureFont(textStyle);
+      const metrics = context.measureText(measuredText);
+      measuredWidth = finiteNumber(metrics?.width, measuredWidth);
+      ascent = finiteNumber(metrics?.actualBoundingBoxAscent, ascent);
+      descent = finiteNumber(metrics?.actualBoundingBoxDescent, descent);
+    }
+    const layoutWidth = finiteOptionalNumber(width);
+    const maxLines = finiteOptionalNumber(paragraphStyle?.maxLines);
+    let lines = 1;
+    let maxWidth = measuredWidth;
+    if (layoutWidth !== null && layoutWidth > 0) {
+      if (maxLines === 1) {
+        maxWidth = layoutWidth;
+      } else if (measuredWidth > layoutWidth) {
+        lines = Math.max(1, Math.ceil(measuredWidth / layoutWidth));
+        if (maxLines !== null && maxLines > 0) {
+          lines = Math.min(lines, maxLines);
+        }
+        maxWidth = layoutWidth;
+      }
+    }
+    const height = (ascent + descent || lineHeight) * lines;
+    return { maxWidth, height };
   }
   function serializeArg(value2, depth = 0, seen = /* @__PURE__ */ new WeakSet()) {
     if (value2 === null || value2 === void 0) return value2;
@@ -85197,7 +85362,15 @@
       return this._push("addRRect", [rrect]);
     }
     transform(matrix2) {
-      return this._push("transform", [matrix2]);
+      record("Path.transform", [matrix2]);
+      if (shouldSkipDuplicatePathTranslate(this.ops, matrix2)) {
+        hostLog("debug", "Path.transform:skip-duplicate-translate", {
+          matrix: matrix2
+        });
+        return this;
+      }
+      this.ops.push(["transform", matrix2]);
+      return this;
     }
     copy() {
       record("Path.copy", []);
@@ -85288,24 +85461,36 @@
     }
   };
   var FakeParagraph = class {
-    constructor(text, style) {
+    constructor(text, paragraphStyle, textStyle, sourceLayout) {
       defineFake(this, "Paragraph");
       this.text = text || "";
       this.width = 0;
-      this.style = style || {};
-      record("new Paragraph", [text, style]);
+      this.paragraphStyle = paragraphStyle || {};
+      this.textStyle = textStyle || {};
+      this.sourceLayout = sourceLayout || {};
+      this.metrics = measureParagraph(this.text, this.textStyle, this.paragraphStyle, 0);
+      record("new Paragraph", [text, paragraphStyle, textStyle, sourceLayout]);
     }
     layout(width) {
       this.width = Number(width) || 0;
+      this.metrics = measureParagraph(
+        this.text,
+        this.textStyle,
+        this.paragraphStyle,
+        this.width
+      );
       record("Paragraph.layout", [width]);
     }
     getHeight() {
       record("Paragraph.getHeight", []);
-      return 14;
+      return finiteNumber(this.metrics?.height, finiteNumber(this.textStyle?.fontSize, 12));
     }
     getMaxWidth() {
       record("Paragraph.getMaxWidth", []);
-      return this.width || Math.max(1, this.text.length * 8);
+      return finiteNumber(
+        this.metrics?.maxWidth,
+        this.width || Math.max(1, this.text.length * 8)
+      );
     }
     delete() {
       record("Paragraph.delete", []);
@@ -85317,7 +85502,9 @@
       this.style = style;
       this.fontMgr = fontMgr;
       this.parts = [];
-      this.currentStyle = { ...style?.style?.textStyle || {} };
+      this.paragraphStyle = { ...style?.style || {} };
+      this.styleStack = [{ ...style?.style?.textStyle || {} }];
+      this.sourceLayout = { ...globalThis.__fakeCanvasKitTextLayoutContext || {} };
       record("new ParagraphBuilder", [style, fontMgr]);
     }
     addText(text) {
@@ -85326,20 +85513,30 @@
       return this;
     }
     pushStyle(style) {
-      this.currentStyle = {
-        ...this.currentStyle,
+      const currentStyle = this.styleStack[this.styleStack.length - 1] || {};
+      this.styleStack.push({
+        ...currentStyle,
         ...style || {}
-      };
+      });
       record("ParagraphBuilder.pushStyle", [style]);
       return this;
     }
     pop() {
       record("ParagraphBuilder.pop", []);
+      if (this.styleStack.length > 1) {
+        this.styleStack.pop();
+      }
       return this;
     }
     build() {
       record("ParagraphBuilder.build", []);
-      return new FakeParagraph(this.parts.join(""), this.currentStyle);
+      const currentStyle = this.styleStack[this.styleStack.length - 1] || {};
+      return new FakeParagraph(
+        this.parts.join(""),
+        this.paragraphStyle,
+        currentStyle,
+        this.sourceLayout
+      );
     }
     delete() {
       record("ParagraphBuilder.delete", []);
@@ -85901,6 +86098,17 @@
       internal.renderDisplayObject = function patchedRenderDisplayObject(object, canvas) {
         normalizeRectRadius(object);
         normalizePaintOpacity(object);
+        const previousTextLayout = globalThis.__fakeCanvasKitTextLayoutContext;
+        if (object?.nodeName === "text") {
+          globalThis.__fakeCanvasKitTextLayoutContext = {
+            textAlign: object.parsedStyle?.textAlign,
+            textBaseline: object.parsedStyle?.textBaseline,
+            x: object.parsedStyle?.x,
+            y: object.parsedStyle?.y,
+            dx: object.parsedStyle?.dx,
+            dy: object.parsedStyle?.dy
+          };
+        }
         try {
           return originalRenderDisplayObject.call(this, object, canvas);
         } catch (error3) {
@@ -85916,6 +86124,8 @@
             text: String(error3)
           });
           throw error3;
+        } finally {
+          globalThis.__fakeCanvasKitTextLayoutContext = previousTextLayout;
         }
       };
       internal.apply = function patchedApply(context) {
@@ -86005,36 +86215,6 @@
       globalThis.__rust_log(String(level), `${String(message)}${suffix}`);
     }
   }
-  function syncTicksOfDomainsFromZero(scales) {
-    scales.forEach((scale10) => scale10.update({ nice: true }));
-    const normalize10 = (d4) => d4 / Math.pow(10, Math.ceil(Math.log(d4) / Math.LN10));
-    const maxes = scales.map((scale10) => scale10.getOptions().domain[1]);
-    const normalized = maxes.map(normalize10);
-    const normalizedMax = Math.max(...normalized);
-    for (let i2 = 0; i2 < scales.length; i2 += 1) {
-      const scale10 = scales[i2];
-      const domain = scale10.getOptions().domain;
-      const t = maxes[i2] / normalized[i2];
-      const newDomainMax = normalizedMax * t;
-      scale10.update({ domain: [domain[0], newDomainMax] });
-    }
-  }
-  function buildSampleData() {
-    return [
-      { Month: "Jan", Evaporation: 2, Precipitation: 2.6, Temperature: 2 },
-      { Month: "Feb", Evaporation: 4.9, Precipitation: 5.9, Temperature: 2.2 },
-      { Month: "Mar", Evaporation: 7, Precipitation: 9, Temperature: 3.3 },
-      { Month: "Apr", Evaporation: 23.2, Precipitation: 26.4, Temperature: 4.5 },
-      { Month: "May", Evaporation: 25.6, Precipitation: 28.7, Temperature: 6.3 },
-      { Month: "Jun", Evaporation: 76.7, Precipitation: 70.7, Temperature: 10.2 },
-      { Month: "Jul", Evaporation: 135.6, Precipitation: 175.6, Temperature: 20.3 },
-      { Month: "Aug", Evaporation: 162.2, Precipitation: 182.2, Temperature: 23.4 },
-      { Month: "Sep", Evaporation: 32.6, Precipitation: 48.7, Temperature: 23 },
-      { Month: "Oct", Evaporation: 20, Precipitation: 18.8, Temperature: 16.5 },
-      { Month: "Nov", Evaporation: 6.4, Precipitation: 6, Temperature: 12 },
-      { Month: "Dec", Evaporation: 3.3, Precipitation: 2.3, Temperature: 6.2 }
-    ];
-  }
   function createRenderer(options = {}) {
     const wasmDir = options.wasmDir || "https://unpkg.com/canvaskit-wasm@0.34.0/bin/";
     hostLog3("info", "creating canvaskit renderer", { wasmDir });
@@ -86062,28 +86242,11 @@
     return container;
   }
   function configureChart(chart, options = {}) {
-    const data2 = options.data || buildSampleData();
-    chart.data(data2);
-    chart.line().encode("x", "Month").encode("y", "Temperature").encode("color", "#EE6666").encode("shape", "smooth").animate(false).scale("y", {
-      independent: true,
-      groupTransform: syncTicksOfDomainsFromZero
-    }).axis("y", {
-      title: "Temperature (\xB0C)",
-      grid: null,
-      titleFill: "#EE6666"
-    });
-    chart.interval().encode("x", "Month").encode("y", "Evaporation").encode("color", "#5470C6").animate(false).scale("y", { independent: true }).style("fillOpacity", 0.8).axis("y", {
-      position: "right",
-      title: "Evaporation (ml)",
-      titleFill: "#5470C6"
-    });
-    chart.line().encode("x", "Month").encode("y", "Precipitation").encode("color", "#91CC75").animate(false).scale("y", { independent: true }).style("lineWidth", 2).style("lineDash", [2, 2]).axis("y", {
-      position: "right",
-      title: "Precipitation (ml)",
-      grid: null,
-      titleFill: "#91CC75"
-    });
-    hostLog3("info", "configured combo chart", { rows: data2.length });
+    chart.area().data({
+      type: "fetch",
+      value: "https://gw.alipayobjects.com/os/bmw-prod/e58c9758-0a09-4527-aa90-fbf175b45925.json"
+    }).transform({ type: "stackY", orderBy: "value" }).encode("x", (d4) => new Date(d4.date)).encode("y", "unemployed").encode("color", "industry").encode("shape", "smooth").animate(false).scale("x", { utc: true }).axis("x", { title: "Date" }).axis("y", { labelFormatter: "~s" }).legend("color", { size: 72, autoWrap: true, maxRows: 3, cols: 6 });
+    hostLog3("info", "configured stacked area chart");
   }
   async function runG2Probe(options = {}) {
     hostLog3("info", "runG2Probe:start", options);

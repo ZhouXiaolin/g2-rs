@@ -157,18 +157,76 @@
     this._lastFontSize = 12;
   }
 
+  function parseFontSpec(fontSpec) {
+    var spec = String(fontSpec || "").trim();
+    var match = spec.match(/(?:(italic|oblique)\s+)?(?:(\d{3}|bold|normal)\s+)?(\d+(?:\.\d+)?)px\s+(.+)/i);
+    if (!match) {
+      return {
+        italic: false,
+        weight: 400,
+        size: 12,
+        families: "sans-serif",
+      };
+    }
+
+    var weight = 400;
+    var rawWeight = String(match[2] || "").toLowerCase();
+    if (rawWeight === "bold") weight = 700;
+    else if (rawWeight && rawWeight !== "normal") weight = Number(rawWeight) || 400;
+
+    return {
+      italic: !!match[1],
+      weight: weight,
+      size: Number(match[3]) || 12,
+      families: match[4] || "sans-serif",
+    };
+  }
+
+  function measureTextWithRust(text, fontSpec) {
+    if (typeof globalThis.__rust_measure_text !== "function") return null;
+    try {
+      var parsed = parseFontSpec(fontSpec);
+      var payload = globalThis.__rust_measure_text(
+        String(text || ""),
+        parsed.size,
+        parsed.families,
+        parsed.weight,
+        parsed.italic,
+      );
+      return payload ? JSON.parse(payload) : null;
+    } catch (error) {
+      hostLog("warn", "[2d.measureText:rustrt] " + String(error));
+      return null;
+    }
+  }
+
   Canvas2DContext.prototype.measureText = function (text) {
     var value = String(text || "");
-    var match = /(\d+(?:\.\d+)?)px/.exec(String(this.font || ""));
-    var fontSize = match ? Number(match[1]) : 12;
-    var width = value.length * fontSize * 0.6;
+    var parsed = parseFontSpec(this.font);
+    var fontSize = parsed.size;
+    var metrics = measureTextWithRust(value, this.font);
+    var width = metrics && Number.isFinite(Number(metrics.width))
+      ? Number(metrics.width)
+      : value.length * fontSize * 0.6;
     hostLog("debug", "[2d.measureText] " + value + " => " + width);
     return {
       width: width,
-      actualBoundingBoxAscent: fontSize * 0.8,
-      actualBoundingBoxDescent: fontSize * 0.2,
-      fontBoundingBoxAscent: fontSize * 0.8,
-      fontBoundingBoxDescent: fontSize * 0.2,
+      actualBoundingBoxAscent:
+        metrics && Number.isFinite(Number(metrics.actualBoundingBoxAscent))
+          ? Number(metrics.actualBoundingBoxAscent)
+          : fontSize * 0.8,
+      actualBoundingBoxDescent:
+        metrics && Number.isFinite(Number(metrics.actualBoundingBoxDescent))
+          ? Number(metrics.actualBoundingBoxDescent)
+          : fontSize * 0.2,
+      fontBoundingBoxAscent:
+        metrics && Number.isFinite(Number(metrics.fontBoundingBoxAscent))
+          ? Number(metrics.fontBoundingBoxAscent)
+          : fontSize * 0.8,
+      fontBoundingBoxDescent:
+        metrics && Number.isFinite(Number(metrics.fontBoundingBoxDescent))
+          ? Number(metrics.fontBoundingBoxDescent)
+          : fontSize * 0.2,
     };
   };
 
@@ -289,9 +347,48 @@
     return element;
   }
 
-  function fetchStub(input) {
-    hostLog("error", "[fetch] " + String(input));
-    return Promise.reject(new Error("fetch not implemented in rquickjs host: " + input));
+  function resolveRequestUrl(input) {
+    if (typeof input === "string") return input;
+    if (input && typeof input.url === "string") return input.url;
+    return String(input);
+  }
+
+  function createFetchResponse(url, bodyText) {
+    return {
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      url: url,
+      headers: {
+        get: function (_name) {
+          return null;
+        },
+      },
+      text: function () {
+        return Promise.resolve(bodyText);
+      },
+      json: function () {
+        return Promise.resolve(JSON.parse(bodyText));
+      },
+      arrayBuffer: function () {
+        var bytes = new TextEncoder().encode(bodyText);
+        return Promise.resolve(bytes.buffer.slice(0));
+      },
+    };
+  }
+
+  function hostFetch(input) {
+    var url = resolveRequestUrl(input);
+    hostLog("info", "[fetch] " + url);
+    try {
+      if (typeof globalThis.__rust_fetch_text !== "function") {
+        throw new Error("__rust_fetch_text is not installed");
+      }
+      var bodyText = globalThis.__rust_fetch_text(url);
+      return Promise.resolve(createFetchResponse(url, bodyText));
+    } catch (error) {
+      return Promise.reject(error);
+    }
   }
 
   globalThis.window = globalThis;
@@ -316,7 +413,7 @@
       paddingBottom: style.paddingBottom || "0px",
     };
   };
-  globalThis.fetch = fetchStub;
+  globalThis.fetch = hostFetch;
   globalThis.HTMLCanvasElement = CanvasElement;
   globalThis.OffscreenCanvas = CanvasElement;
   globalThis.addEventListener = function (type) {

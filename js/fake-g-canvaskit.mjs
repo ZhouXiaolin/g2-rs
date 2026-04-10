@@ -192,6 +192,17 @@ class PatchedCanvasKitPlugin extends CanvaskitRenderer.Plugin {
     internal.renderDisplayObject = function patchedRenderDisplayObject(object, canvas) {
       normalizeRectRadius(object);
       normalizePaintOpacity(object);
+      const previousTextLayout = globalThis.__fakeCanvasKitTextLayoutContext;
+      if (object?.nodeName === "text") {
+        globalThis.__fakeCanvasKitTextLayoutContext = {
+          textAlign: object.parsedStyle?.textAlign,
+          textBaseline: object.parsedStyle?.textBaseline,
+          x: object.parsedStyle?.x,
+          y: object.parsedStyle?.y,
+          dx: object.parsedStyle?.dx,
+          dy: object.parsedStyle?.dy,
+        };
+      }
       try {
         return originalRenderDisplayObject.call(this, object, canvas);
       } catch (error) {
@@ -207,6 +218,8 @@ class PatchedCanvasKitPlugin extends CanvaskitRenderer.Plugin {
           text: String(error),
         });
         throw error;
+      } finally {
+        globalThis.__fakeCanvasKitTextLayoutContext = previousTextLayout;
       }
     };
 

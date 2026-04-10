@@ -11,38 +11,6 @@ function hostLog(level, message, extra) {
   }
 }
 
-function syncTicksOfDomainsFromZero(scales) {
-  scales.forEach((scale) => scale.update({ nice: true }));
-  const normalize = (d) => d / Math.pow(10, Math.ceil(Math.log(d) / Math.LN10));
-  const maxes = scales.map((scale) => scale.getOptions().domain[1]);
-  const normalized = maxes.map(normalize);
-  const normalizedMax = Math.max(...normalized);
-  for (let i = 0; i < scales.length; i += 1) {
-    const scale = scales[i];
-    const domain = scale.getOptions().domain;
-    const t = maxes[i] / normalized[i];
-    const newDomainMax = normalizedMax * t;
-    scale.update({ domain: [domain[0], newDomainMax] });
-  }
-}
-
-function buildSampleData() {
-  return [
-    { Month: "Jan", Evaporation: 2, Precipitation: 2.6, Temperature: 2 },
-    { Month: "Feb", Evaporation: 4.9, Precipitation: 5.9, Temperature: 2.2 },
-    { Month: "Mar", Evaporation: 7, Precipitation: 9, Temperature: 3.3 },
-    { Month: "Apr", Evaporation: 23.2, Precipitation: 26.4, Temperature: 4.5 },
-    { Month: "May", Evaporation: 25.6, Precipitation: 28.7, Temperature: 6.3 },
-    { Month: "Jun", Evaporation: 76.7, Precipitation: 70.7, Temperature: 10.2 },
-    { Month: "Jul", Evaporation: 135.6, Precipitation: 175.6, Temperature: 20.3 },
-    { Month: "Aug", Evaporation: 162.2, Precipitation: 182.2, Temperature: 23.4 },
-    { Month: "Sep", Evaporation: 32.6, Precipitation: 48.7, Temperature: 23 },
-    { Month: "Oct", Evaporation: 20, Precipitation: 18.8, Temperature: 16.5 },
-    { Month: "Nov", Evaporation: 6.4, Precipitation: 6, Temperature: 12 },
-    { Month: "Dec", Evaporation: 3.3, Precipitation: 2.3, Temperature: 6.2 },
-  ];
-}
-
 function createRenderer(options = {}) {
   const wasmDir =
     options.wasmDir || "https://unpkg.com/canvaskit-wasm@0.34.0/bin/";
@@ -73,57 +41,25 @@ function createContainer(options = {}) {
 }
 
 function configureChart(chart, options = {}) {
-  const data = options.data || buildSampleData();
-  chart.data(data);
-
   chart
-    .line()
-    .encode("x", "Month")
-    .encode("y", "Temperature")
-    .encode("color", "#EE6666")
+    .area()
+    .data({
+      type: "fetch",
+      value:
+        "https://gw.alipayobjects.com/os/bmw-prod/e58c9758-0a09-4527-aa90-fbf175b45925.json",
+    })
+    .transform({ type: "stackY", orderBy: "value" })
+    .encode("x", (d) => new Date(d.date))
+    .encode("y", "unemployed")
+    .encode("color", "industry")
     .encode("shape", "smooth")
     .animate(false)
-    .scale("y", {
-      independent: true,
-      groupTransform: syncTicksOfDomainsFromZero,
-    })
-    .axis("y", {
-      title: "Temperature (°C)",
-      grid: null,
-      titleFill: "#EE6666",
-    });
+    .scale("x", { utc: true })
+    .axis("x", { title: "Date" })
+    .axis("y", { labelFormatter: "~s" })
+    .legend("color", { size: 72, autoWrap: true, maxRows: 3, cols: 6 });
 
-  chart
-    .interval()
-    .encode("x", "Month")
-    .encode("y", "Evaporation")
-    .encode("color", "#5470C6")
-    .animate(false)
-    .scale("y", { independent: true })
-    .style("fillOpacity", 0.8)
-    .axis("y", {
-      position: "right",
-      title: "Evaporation (ml)",
-      titleFill: "#5470C6",
-    });
-
-  chart
-    .line()
-    .encode("x", "Month")
-    .encode("y", "Precipitation")
-    .encode("color", "#91CC75")
-    .animate(false)
-    .scale("y", { independent: true })
-    .style("lineWidth", 2)
-    .style("lineDash", [2, 2])
-    .axis("y", {
-      position: "right",
-      title: "Precipitation (ml)",
-      grid: null,
-      titleFill: "#91CC75",
-    });
-
-  hostLog("info", "configured combo chart", { rows: data.length });
+  hostLog("info", "configured stacked area chart");
 }
 
 export async function runG2Probe(options = {}) {
