@@ -333,7 +333,7 @@
   var document = new Document();
   var rafId = 1;
   var rafCount = 0;
-  var maxRafCallbacks = 8192;
+  var maxRafCallbacks = 16;
   var hostConsoleEntries = [];
 
   function ensureContainer(id) {
@@ -430,9 +430,7 @@
       return id;
     }
     rafCount += 1;
-    Promise.resolve().then(function () {
-      if (typeof callback === "function") callback(0);
-    });
+    if (typeof callback === "function") callback(Date.now());
     return id;
   };
   globalThis.cancelAnimationFrame = function () {};

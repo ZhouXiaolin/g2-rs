@@ -5163,7 +5163,7 @@
                   return parseNodeTree(context, childNode2, parent, root2);
                 });
               } else {
-                var container = createContainer2(context, childNode);
+                var container = createContainer(context, childNode);
                 if (container.styles.isVisible()) {
                   if (createsRealStackingContext(childNode, container, root2)) {
                     container.flags |= 4;
@@ -5185,7 +5185,7 @@
             }
           }
         };
-        var createContainer2 = function(context, element) {
+        var createContainer = function(context, element) {
           if (isImageElement(element)) {
             return new ImageElementContainer(context, element);
           }
@@ -5216,7 +5216,7 @@
           return new ElementContainer(context, element);
         };
         var parseTree = function(context, element) {
-          var container = createContainer2(context, element);
+          var container = createContainer(context, element);
           container.flags |= 4;
           parseNodeTree(context, element, container, container);
           return container;
@@ -84943,19 +84943,39 @@
   var CanvasKitInit = canvaskit.exports;
 
   // shims/fake-canvaskit.js
-  function hostLog(level, message, extra) {
-    const suffix = extra === void 0 ? "" : ` ${typeof extra === "string" ? extra : JSON.stringify(extra)}`;
-    if (typeof globalThis.__rust_log === "function") {
-      globalThis.__rust_log(String(level), `${String(message)}${suffix}`);
-    }
-  }
   var trace = [];
   var commands = [];
   var nextId = 1;
   var MAX_TRACE = 2e3;
   var MAX_COMMANDS = 1e4;
-  var MAX_HOST_LOG = 200;
-  var hostLogCount = 0;
+  function cloneTaggedValue(value2, depth = 0, seen = /* @__PURE__ */ new WeakSet()) {
+    if (value2 === null || value2 === void 0) return value2;
+    if (typeof value2 === "string" || typeof value2 === "number" || typeof value2 === "boolean") {
+      return value2;
+    }
+    if (depth >= 4) return null;
+    if (Array.isArray(value2)) {
+      return value2.slice(0, 24).map((item) => cloneTaggedValue(item, depth + 1, seen));
+    }
+    if (typeof value2 !== "object") return String(value2);
+    if (seen.has(value2)) return "[Circular]";
+    seen.add(value2);
+    const out = {};
+    for (const [key, item] of Object.entries(value2).slice(0, 24)) {
+      out[key] = cloneTaggedValue(item, depth + 1, seen);
+    }
+    return out;
+  }
+  function snapshotCurrentSource() {
+    const source = globalThis.__fakeCanvasKitCurrentObject;
+    if (!source || typeof source !== "object") return null;
+    return cloneTaggedValue(source);
+  }
+  function snapshotCurrentPaints() {
+    const paints = globalThis.__fakeCanvasKitCurrentPaints;
+    if (!paints || typeof paints !== "object") return null;
+    return cloneTaggedValue(paints);
+  }
   function record(name2, args) {
     const entry = {
       index: trace.length,
@@ -84963,16 +84983,14 @@
       args: Array.from(args || []).map((value2) => serializeArg(value2))
     };
     if (trace.length < MAX_TRACE) trace.push(entry);
-    if (hostLogCount < MAX_HOST_LOG) {
-      hostLogCount += 1;
-      hostLog("debug", `[fake-canvaskit] ${name2}`, entry.args);
-    }
     return entry;
   }
   function recordCommand(kind, payload = {}) {
     const entry = {
       index: commands.length,
       kind,
+      source: snapshotCurrentSource(),
+      sourcePaints: snapshotCurrentPaints(),
       ...payload
     };
     if (commands.length < MAX_COMMANDS) commands.push(entry);
@@ -85363,12 +85381,7 @@
     }
     transform(matrix2) {
       record("Path.transform", [matrix2]);
-      if (shouldSkipDuplicatePathTranslate(this.ops, matrix2)) {
-        hostLog("debug", "Path.transform:skip-duplicate-translate", {
-          matrix: matrix2
-        });
-        return this;
-      }
+      if (shouldSkipDuplicatePathTranslate(this.ops, matrix2)) return this;
       this.ops.push(["transform", matrix2]);
       return this;
     }
@@ -85702,14 +85715,12 @@
         },
         requestAnimationFrame(callback) {
           record("Surface.requestAnimationFrame", arguments);
-          if (frameCount >= 4) {
+          if (frameCount >= 1) {
             record("Surface.requestAnimationFrame.skipped", [frameCount]);
             return frameCount;
           }
           frameCount += 1;
-          Promise.resolve().then(() => {
-            if (typeof callback === "function") callback(canvas);
-          });
+          if (typeof callback === "function") callback(canvas);
           return frameCount;
         },
         flush() {
@@ -85936,7 +85947,10 @@
     return function fakeCanvasKitInit(options = {}) {
       trace.length = 0;
       commands.length = 0;
-      hostLogCount = 0;
+      nextId = 1;
+      globalThis.__fakeCanvasKitCurrentObject = null;
+      globalThis.__fakeCanvasKitCurrentPaints = null;
+      globalThis.__fakeCanvasKitTextLayoutContext = null;
       record("CanvasKitInit", [options]);
       const kit = createFakeCanvasKit();
       globalThis.__fakeCanvasKit = kit;
@@ -85953,7 +85967,7 @@
   // fake-g-canvaskit.mjs
   var CanvasKitInit2 = createFakeCanvasKitInit();
   var canvasRunPatched = false;
-  function hostLog2(level, message, extra) {
+  function hostLog(level, message, extra) {
     const suffix = extra === void 0 ? "" : ` ${typeof extra === "string" ? extra : JSON.stringify(extra)}`;
     if (typeof globalThis.__rust_log === "function") {
       globalThis.__rust_log(String(level), `${String(message)}${suffix}`);
@@ -85964,11 +85978,10 @@
     canvasRunPatched = true;
     const canvasProto = Canvas?.prototype;
     if (!canvasProto || typeof canvasProto.run !== "function") {
-      hostLog2("warn", "failed to patch GCanvas.run");
+      hostLog("warn", "failed to patch GCanvas.run");
       return;
     }
     canvasProto.run = function patchedRun() {
-      hostLog2("info", "patched GCanvas.run:single-frame");
       this.render({ reason: "single-frame-probe" });
       this.frameId = 0;
     };
@@ -85988,12 +86001,6 @@
       ...object.parsedStyle,
       radius: normalized
     };
-    hostLog2("debug", "normalized rect.radius", {
-      radius,
-      normalized,
-      width: object.parsedStyle.width,
-      height: object.parsedStyle.height
-    });
   }
   function normalizePaintOpacity(object) {
     if (!object?.parsedStyle) return;
@@ -86007,6 +86014,99 @@
     }
     if (changed) {
       object.parsedStyle = next;
+    }
+  }
+  function summarizeColor(value2) {
+    if (!value2) return value2;
+    if (typeof value2 === "string") return value2;
+    if (Array.isArray(value2)) return value2.slice(0, 4);
+    if (typeof value2 === "object") {
+      return {
+        r: value2.r,
+        g: value2.g,
+        b: value2.b,
+        alpha: value2.alpha,
+        isNone: value2.isNone
+      };
+    }
+    return String(value2);
+  }
+  function summarizePaint(paint) {
+    if (!paint || typeof paint !== "object") return null;
+    const state = paint.state || {};
+    return {
+      fakeId: paint.__fakeId || null,
+      style: typeof state.style === "string" ? state.style : null,
+      color: Array.isArray(state.color) ? state.color.slice(0, 4) : null,
+      alpha: Number.isFinite(Number(state.alpha)) ? Number(state.alpha) : null,
+      strokeWidth: Number.isFinite(Number(state.strokeWidth)) ? Number(state.strokeWidth) : null,
+      strokeCap: typeof state.strokeCap === "string" ? state.strokeCap : null,
+      hasShader: state.shader !== void 0,
+      hasPathEffect: state.pathEffect !== void 0,
+      hasMaskFilter: state.maskFilter !== void 0,
+      stateKeys: Object.keys(state)
+    };
+  }
+  function summarizeRenderContext(context) {
+    if (!context || typeof context !== "object") return null;
+    return {
+      fillPaint: summarizePaint(context.fillPaint),
+      strokePaint: summarizePaint(context.strokePaint),
+      shadowFillPaint: summarizePaint(context.shadowFillPaint),
+      shadowStrokePaint: summarizePaint(context.shadowStrokePaint)
+    };
+  }
+  function summarizeDisplayObject(object) {
+    if (!object || typeof object !== "object") return null;
+    const style = object.parsedStyle || {};
+    return {
+      nodeName: object.nodeName || null,
+      id: object.id || null,
+      name: object.name || null,
+      className: typeof object.className === "string" ? object.className : object.className?.toString?.() || null,
+      entity: Number.isFinite(Number(object.entity)) || typeof object.entity === "string" ? object.entity : null,
+      type: style.type || object.type || null,
+      x1: Number.isFinite(Number(style.x1)) ? Number(style.x1) : null,
+      y1: Number.isFinite(Number(style.y1)) ? Number(style.y1) : null,
+      x2: Number.isFinite(Number(style.x2)) ? Number(style.x2) : null,
+      y2: Number.isFinite(Number(style.y2)) ? Number(style.y2) : null,
+      lineWidth: Number.isFinite(Number(style.lineWidth)) ? Number(style.lineWidth) : null,
+      lineCap: typeof style.lineCap === "string" ? style.lineCap : null,
+      opacity: Number.isFinite(Number(style.opacity)) ? Number(style.opacity) : null,
+      fillOpacity: Number.isFinite(Number(style.fillOpacity)) ? Number(style.fillOpacity) : null,
+      strokeOpacity: Number.isFinite(Number(style.strokeOpacity)) ? Number(style.strokeOpacity) : null,
+      visibility: style.visibility ?? null,
+      stroke: summarizeColor(style.stroke),
+      fill: summarizeColor(style.fill)
+    };
+  }
+  function pushRenderSource(object, context = null) {
+    const previousObject = globalThis.__fakeCanvasKitCurrentObject;
+    const previousPaints = globalThis.__fakeCanvasKitCurrentPaints;
+    globalThis.__fakeCanvasKitCurrentObject = summarizeDisplayObject(object);
+    globalThis.__fakeCanvasKitCurrentPaints = summarizeRenderContext(context);
+    return () => {
+      globalThis.__fakeCanvasKitCurrentObject = previousObject;
+      globalThis.__fakeCanvasKitCurrentPaints = previousPaints;
+    };
+  }
+  function patchRendererContributions(internal) {
+    const contributions = internal?.rendererContributionFactory;
+    if (!contributions || typeof contributions !== "object") return;
+    for (const renderer of Object.values(contributions)) {
+      if (!renderer || typeof renderer.render !== "function" || renderer.__probeWrapped) {
+        continue;
+      }
+      const originalRender = renderer.render;
+      renderer.render = function patchedRendererRender(object, context) {
+        const popSource = pushRenderSource(object, context);
+        try {
+          return originalRender.call(this, object, context);
+        } finally {
+          popSource();
+        }
+      };
+      renderer.__probeWrapped = true;
     }
   }
   function walkDisplayObjects(object, visit) {
@@ -86090,14 +86190,17 @@
       delete this.context.ContextService;
     }
   };
+  var endFrameGeneration = 0;
   var PatchedCanvasKitPlugin = class extends index4.Plugin {
     init() {
       super.init();
       const internal = this.plugins[0];
+      patchRendererContributions(internal);
       const originalRenderDisplayObject = internal.renderDisplayObject;
       internal.renderDisplayObject = function patchedRenderDisplayObject(object, canvas) {
         normalizeRectRadius(object);
         normalizePaintOpacity(object);
+        const popSource = pushRenderSource(object);
         const previousTextLayout = globalThis.__fakeCanvasKitTextLayoutContext;
         if (object?.nodeName === "text") {
           globalThis.__fakeCanvasKitTextLayoutContext = {
@@ -86112,7 +86215,7 @@
         try {
           return originalRenderDisplayObject.call(this, object, canvas);
         } catch (error3) {
-          hostLog2("error", "renderDisplayObject:failed", {
+          hostLog("error", "renderDisplayObject:failed", {
             nodeName: object?.nodeName,
             radius: object?.parsedStyle?.radius,
             x: object?.parsedStyle?.x,
@@ -86126,6 +86229,7 @@
           throw error3;
         } finally {
           globalThis.__fakeCanvasKitTextLayoutContext = previousTextLayout;
+          popSource();
         }
       };
       internal.apply = function patchedApply(context) {
@@ -86134,7 +86238,6 @@
         renderingService.hooks.init.tap("fake-canvaskit-renderer", () => {
           const { surface } = this.context.contextService.getContext();
           const dpr = this.context.contextService.getDPR();
-          hostLog2("debug", "fake renderer init", { dpr });
           surface.getCanvas().scale(dpr, dpr);
         });
         renderingService.hooks.endFrame.tap("fake-canvaskit-renderer", () => {
@@ -86143,7 +86246,6 @@
           const clearColor = parseColor(this.context.config.background);
           const tmpVec3 = [0, 0, 0];
           const tmpQuat = [0, 0, 0, 1];
-          hostLog2("debug", "fake renderer endFrame:begin");
           try {
             canvas.save();
             this.applyCamera(canvas, this.context.camera, tmpVec3, tmpQuat);
@@ -86159,7 +86261,7 @@
             this.drawWithSurface(canvas, renderingContext.root);
             surface.flush();
           } catch (error3) {
-            hostLog2(
+            hostLog(
               "error",
               "fake renderer endFrame:failed",
               {
@@ -86174,8 +86276,10 @@
             this.restoreStack.forEach(() => canvas.restore());
             this.restoreStack = [];
             canvas.restore();
-            hostLog2("debug", "fake renderer endFrame:done");
           }
+          endFrameGeneration += 1;
+          globalThis.__g2EndFrameGeneration = endFrameGeneration;
+          hostLog("info", "endFrame:complete", { generation: endFrameGeneration });
         });
         renderingService.hooks.destroy.tap("fake-canvaskit-renderer", () => {
           const { surface } = this.context.contextService.getContext();
@@ -86209,7 +86313,7 @@
   };
 
   // g2-probe.mjs
-  function hostLog3(level, message, extra) {
+  function hostLog2(level, message, extra) {
     const suffix = extra === void 0 ? "" : ` ${typeof extra === "string" ? extra : JSON.stringify(extra)}`;
     if (typeof globalThis.__rust_log === "function") {
       globalThis.__rust_log(String(level), `${String(message)}${suffix}`);
@@ -86217,89 +86321,240 @@
   }
   function createRenderer(options = {}) {
     const wasmDir = options.wasmDir || "https://unpkg.com/canvaskit-wasm@0.34.0/bin/";
-    hostLog3("info", "creating canvaskit renderer", { wasmDir });
+    hostLog2("info", "creating canvaskit renderer", { wasmDir });
     return new Renderer2({ wasmDir });
   }
-  function createContainer(options = {}) {
-    const id4 = options.containerId || "g2-root";
+  function ensureContainer(options = {}) {
+    const id4 = options.containerId || "container";
     const width = options.width || 960;
     const height = options.height || 540;
-    if (typeof globalThis.__createProbeContainer === "function") {
-      const container2 = globalThis.__createProbeContainer(id4);
-      container2.width = width;
-      container2.height = height;
-      container2.style.width = `${width}px`;
-      container2.style.height = `${height}px`;
-      hostLog3("info", "using injected probe container", { id: id4 });
-      return container2;
+    let container = document.getElementById(id4);
+    if (!container && typeof globalThis.__createProbeContainer === "function") {
+      container = globalThis.__createProbeContainer(id4);
     }
-    hostLog3("warn", "falling back to document.createElement('div')", { id: id4 });
-    const container = document.createElement("div");
+    if (!container) {
+      container = document.createElement("div");
+      container.id = id4;
+      if (document.registerElement) {
+        document.registerElement(id4, container);
+      }
+      if (document.body?.appendChild) {
+        document.body.appendChild(container);
+      }
+    }
     container.width = width;
     container.height = height;
     container.style.width = `${width}px`;
     container.style.height = `${height}px`;
+    hostLog2("info", "using probe container", { id: id4, width, height });
     return container;
   }
-  function configureChart(chart, options = {}) {
-    chart.area().data({
-      type: "fetch",
-      value: "https://gw.alipayobjects.com/os/bmw-prod/e58c9758-0a09-4527-aa90-fbf175b45925.json"
-    }).transform({ type: "stackY", orderBy: "value" }).encode("x", (d4) => new Date(d4.date)).encode("y", "unemployed").encode("color", "industry").encode("shape", "smooth").animate(false).scale("x", { utc: true }).axis("x", { title: "Date" }).axis("y", { labelFormatter: "~s" }).legend("color", { size: 72, autoWrap: true, maxRows: 3, cols: 6 });
-    hostLog3("info", "configured stacked area chart");
+  function sanitizeUserScript(source) {
+    return String(source || "").replace(/^\s*import\s+[^;]+;?\s*$/gm, "").replace(/^\s*export\s+/gm, "").trim();
   }
-  async function runG2Probe(options = {}) {
-    hostLog3("info", "runG2Probe:start", options);
+  function createManagedChartClass(renderer, defaultContainer, runtimeOptions = {}) {
+    return class ProbeChart extends Chart {
+      constructor(config = {}) {
+        const next = { ...config };
+        if (!next.container) {
+          next.container = defaultContainer;
+        } else if (typeof next.container === "string") {
+          next.container = document.getElementById(next.container) || defaultContainer;
+        }
+        if (!next.renderer) {
+          next.renderer = renderer;
+        }
+        super(next);
+        this.__probeRenderCalled = false;
+        this.__probeRenderPromise = null;
+        this.__probeRenderSettled = false;
+        this.__probeStaticModeApplied = false;
+        globalThis.__lastProbeChart = this;
+      }
+      render(...args) {
+        applyStaticMode(this, runtimeOptions);
+        this.__probeRenderCalled = true;
+        this.__probeRenderSettled = false;
+        const promise = Promise.resolve(super.render(...args));
+        this.__probeRenderPromise = promise.finally(() => {
+          this.__probeRenderSettled = true;
+        });
+        return this.__probeRenderPromise;
+      }
+      interaction(...args) {
+        hostLog2("info", "chart.interaction:skip", args);
+        return this;
+      }
+    };
+  }
+  function walkOptionsTree(value2, visit, seen = /* @__PURE__ */ new WeakSet()) {
+    if (!value2 || typeof value2 !== "object") return;
+    if (seen.has(value2)) return;
+    seen.add(value2);
+    if (Array.isArray(value2)) {
+      for (const item of value2) walkOptionsTree(item, visit, seen);
+      return;
+    }
+    visit(value2);
+    for (const item of Object.values(value2)) {
+      walkOptionsTree(item, visit, seen);
+    }
+  }
+  function applyStaticMode(chart, options = {}) {
+    if (options.staticMode === false) return;
+    if (!chart || typeof chart.options !== "function") return;
+    if (chart.__probeStaticModeApplied) return;
+    const spec = chart.options();
+    let changed = 0;
+    walkOptionsTree(spec, (node) => {
+      if (!node || typeof node !== "object" || Array.isArray(node)) return;
+      const looksLikeSpecNode = "type" in node || "children" in node || "marks" in node || "encode" in node || "data" in node;
+      if (!looksLikeSpecNode) return;
+      if (node.animate !== false) {
+        node.animate = false;
+        changed += 1;
+      }
+      if ("interaction" in node && node.interaction && Object.keys(node.interaction).length > 0) {
+        node.interaction = {};
+        changed += 1;
+      }
+      if ("tooltip" in node && node.tooltip !== false) {
+        node.tooltip = false;
+        changed += 1;
+      }
+      if ("slider" in node && node.slider) {
+        node.slider = false;
+        changed += 1;
+      }
+      if ("scrollbar" in node && node.scrollbar) {
+        node.scrollbar = false;
+        changed += 1;
+      }
+    });
+    chart.options(spec);
+    chart.__probeStaticModeApplied = true;
+    if (changed > 0) {
+      hostLog2("info", "chart.staticMode:applied", { changed });
+    }
+  }
+  async function waitForRenderableState(chart) {
+    if (chart.__probeRenderPromise) {
+      await chart.__probeRenderPromise;
+    }
+    for (let i2 = 0; i2 < 4; i2++) {
+      await Promise.resolve();
+    }
+  }
+  async function executeUserScript(userScript, options = {}) {
     const renderer = createRenderer(options);
-    const container = createContainer(options);
+    const container = ensureContainer(options);
+    const Chart2 = createManagedChartClass(renderer, container, options);
+    const source = sanitizeUserScript(userScript);
+    if (!source) {
+      throw new Error("G2 script is empty");
+    }
+    globalThis.__lastProbeChart = null;
+    const AsyncFunction = Object.getPrototypeOf(async function() {
+    }).constructor;
+    const fn = new AsyncFunction(
+      "Chart",
+      "options",
+      "hostLog",
+      `${source}
+
+return (typeof chart !== "undefined" ? chart : globalThis.__lastProbeChart);`
+    );
+    const chart = await fn(Chart2, options, hostLog2);
+    if (!chart || typeof chart.render !== "function") {
+      throw new Error("script did not create a chart");
+    }
+    if (chart.__probeRenderCalled) {
+      await waitForRenderableState(chart);
+    } else {
+      hostLog2("info", "chart.render:auto");
+      chart.render();
+      await waitForRenderableState(chart);
+    }
+    return { chart, container };
+  }
+  function countDrawableObjects(object) {
+    if (!object) return 0;
+    const drawable = typeof object.nodeName === "string" && object.nodeName !== "group" && object.nodeName !== "g" && !object.nodeName.startsWith("$");
+    let count4 = drawable ? 1 : 0;
+    const children = Array.isArray(object.childNodes) ? object.childNodes : [];
+    for (const child of children) {
+      count4 += countDrawableObjects(child);
+    }
+    return count4;
+  }
+  function collectRenderResult(chart, container, options = {}) {
+    const hasGetContext = typeof chart.getContext === "function";
+    const context = hasGetContext ? chart.getContext() : null;
+    const gCanvas = context?.canvas;
+    const hasCanvas = !!gCanvas;
+    const hasCanvasRender = !!gCanvas && typeof gCanvas.render === "function";
+    const generationBefore = typeof globalThis.__g2EndFrameGeneration === "number" ? globalThis.__g2EndFrameGeneration : 0;
+    if (gCanvas && typeof gCanvas.render === "function") {
+      gCanvas.render({ reason: "probe-final-render" });
+    } else {
+      hostLog2("warn", "canvas.render:missing", { hasCanvas, hasCanvasRender });
+    }
+    const generationAfter = typeof globalThis.__g2EndFrameGeneration === "number" ? globalThis.__g2EndFrameGeneration : 0;
+    const trace2 = typeof globalThis.__getFakeCanvasKitTrace === "function" ? globalThis.__getFakeCanvasKitTrace() : [];
+    const commands2 = typeof globalThis.__getFakeCanvasKitCommands === "function" ? globalThis.__getFakeCanvasKitCommands() : [];
     const width = options.width || container.clientWidth || 960;
     const height = options.height || container.clientHeight || 540;
-    hostLog3("info", "creating chart", { width, height });
-    const chart = new Chart({
-      container,
-      autoFit: true,
-      renderer
+    const drawCommandCount = commands2.filter(
+      (c6) => typeof c6.kind === "string" && c6.kind.startsWith("draw")
+    ).length;
+    const leafCount = typeof gCanvas?.document?.documentElement !== "undefined" ? countDrawableObjects(gCanvas.document.documentElement) : -1;
+    if (generationAfter <= generationBefore) {
+      hostLog2("warn", "completeness:no-new-endFrame", {
+        generationBefore,
+        generationAfter
+      });
+    }
+    if (leafCount > 0 && drawCommandCount === 0) {
+      hostLog2("warn", "completeness:suspect", { leafCount, drawCommandCount });
+    }
+    hostLog2("info", "completeness:report", {
+      endFrameGeneration: generationAfter,
+      drawCommandCount,
+      leafCount,
+      totalCommandCount: commands2.length
     });
-    configureChart(chart, options);
+    return {
+      ok: true,
+      width,
+      height,
+      childCount: Array.isArray(container.children) ? container.children.length : 0,
+      hasGetContext,
+      hasCanvas,
+      hasCanvasRender,
+      fakeCanvasKitCommandCount: commands2.length,
+      fakeCanvasKitCommands: commands2,
+      fakeCanvasKitTraceCount: trace2.length,
+      fakeCanvasKitTraceTail: trace2.slice(-20)
+    };
+  }
+  function collectCurrentG2ProbeState(options = {}) {
+    const chart = globalThis.__lastProbeChart;
+    const container = document.getElementById(options.containerId || "container") || null;
+    if (!chart || !container) {
+      return null;
+    }
+    return collectRenderResult(chart, container, options);
+  }
+  async function runG2Probe(userScript, options = {}) {
+    hostLog2("info", "runG2Probe:start", options);
     try {
-      hostLog3("info", "chart.render:begin");
-      await chart.render();
-      hostLog3("info", "chart.render:done");
-      const hasGetContext = typeof chart.getContext === "function";
-      hostLog3("info", "chart.context:inspect", { hasGetContext });
-      const context = hasGetContext ? chart.getContext() : null;
-      const gCanvas = context?.canvas;
-      const hasCanvas = !!gCanvas;
-      const hasCanvasRender = !!gCanvas && typeof gCanvas.render === "function";
-      if (gCanvas && typeof gCanvas.render === "function") {
-        hostLog3("info", "canvas.render:begin");
-        gCanvas.render({ reason: "probe-post-render" });
-        hostLog3("info", "canvas.render:done");
-      } else {
-        hostLog3("warn", "canvas.render:missing", { hasCanvas, hasCanvasRender });
-      }
-      const trace2 = typeof globalThis.__getFakeCanvasKitTrace === "function" ? globalThis.__getFakeCanvasKitTrace() : [];
-      const commands2 = typeof globalThis.__getFakeCanvasKitCommands === "function" ? globalThis.__getFakeCanvasKitCommands() : [];
-      const actualWidth = container.clientWidth || width;
-      const actualHeight = container.clientHeight || height;
-      return {
-        ok: true,
-        width: actualWidth,
-        height: actualHeight,
-        childCount: Array.isArray(container.children) ? container.children.length : 0,
-        hasGetContext,
-        hasCanvas,
-        hasCanvasRender,
-        fakeCanvasKitCommandCount: commands2.length,
-        fakeCanvasKitCommands: commands2,
-        fakeCanvasKitTraceCount: trace2.length,
-        fakeCanvasKitTraceTail: trace2.slice(-20)
-      };
+      const { chart, container } = await executeUserScript(userScript, options);
+      return collectRenderResult(chart, container, options);
     } catch (error3) {
       const trace2 = typeof globalThis.__getFakeCanvasKitTrace === "function" ? globalThis.__getFakeCanvasKitTrace() : [];
       const message = error3 && typeof error3 === "object" && "stack" in error3 ? String(error3.stack) : String(error3);
-      hostLog3("error", "chart.render:failed", message);
-      hostLog3("error", "fakeCanvasKit.trace", {
+      hostLog2("error", "chart.render:failed", message);
+      hostLog2("error", "fakeCanvasKit.trace", {
         count: trace2.length,
         tail: trace2.slice(-20)
       });
@@ -86307,6 +86562,7 @@
     }
   }
   globalThis.runG2Probe = runG2Probe;
+  globalThis.collectCurrentG2ProbeState = collectCurrentG2ProbeState;
 })();
 /*! Bundled license information:
 

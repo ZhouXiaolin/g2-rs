@@ -920,14 +920,12 @@ function createFakeSurface(htmlCanvas) {
       },
       requestAnimationFrame(callback) {
         record("Surface.requestAnimationFrame", arguments);
-        if (frameCount >= 4) {
+        if (frameCount >= 1) {
           record("Surface.requestAnimationFrame.skipped", [frameCount]);
           return frameCount;
         }
         frameCount += 1;
-        Promise.resolve().then(() => {
-          if (typeof callback === "function") callback(canvas);
-        });
+        if (typeof callback === "function") callback(canvas);
         return frameCount;
       },
       flush() {

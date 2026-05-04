@@ -161,15 +161,11 @@ function applyStaticMode(chart, options = {}) {
 }
 
 async function waitForRenderableState(chart) {
-  for (let i = 0; i < 256; i += 1) {
+  if (chart.__probeRenderPromise) {
+    await chart.__probeRenderPromise;
+  }
+  for (let i = 0; i < 4; i++) {
     await Promise.resolve();
-    const commands =
-      typeof globalThis.__getFakeCanvasKitCommands === "function"
-        ? globalThis.__getFakeCanvasKitCommands()
-        : [];
-    if (commands.length > 1 || chart.__probeRenderSettled) {
-      return;
-    }
   }
 }
 
@@ -211,17 +207,43 @@ return (typeof chart !== "undefined" ? chart : globalThis.__lastProbeChart);`,
   return { chart, container };
 }
 
+function countDrawableObjects(object) {
+  if (!object) return 0;
+  const drawable =
+    typeof object.nodeName === "string" &&
+    object.nodeName !== "group" &&
+    object.nodeName !== "g" &&
+    !object.nodeName.startsWith("$");
+  let count = drawable ? 1 : 0;
+  const children = Array.isArray(object.childNodes) ? object.childNodes : [];
+  for (const child of children) {
+    count += countDrawableObjects(child);
+  }
+  return count;
+}
+
 function collectRenderResult(chart, container, options = {}) {
   const hasGetContext = typeof chart.getContext === "function";
   const context = hasGetContext ? chart.getContext() : null;
   const gCanvas = context?.canvas;
   const hasCanvas = !!gCanvas;
   const hasCanvasRender = !!gCanvas && typeof gCanvas.render === "function";
+
+  const generationBefore =
+    typeof globalThis.__g2EndFrameGeneration === "number"
+      ? globalThis.__g2EndFrameGeneration
+      : 0;
+
   if (gCanvas && typeof gCanvas.render === "function") {
-    gCanvas.render({ reason: "probe-post-render" });
+    gCanvas.render({ reason: "probe-final-render" });
   } else {
     hostLog("warn", "canvas.render:missing", { hasCanvas, hasCanvasRender });
   }
+
+  const generationAfter =
+    typeof globalThis.__g2EndFrameGeneration === "number"
+      ? globalThis.__g2EndFrameGeneration
+      : 0;
 
   const trace =
     typeof globalThis.__getFakeCanvasKitTrace === "function"
@@ -233,6 +255,32 @@ function collectRenderResult(chart, container, options = {}) {
       : [];
   const width = options.width || container.clientWidth || 960;
   const height = options.height || container.clientHeight || 540;
+
+  const drawCommandCount = commands.filter((c) =>
+    typeof c.kind === "string" && c.kind.startsWith("draw")
+  ).length;
+
+  const leafCount =
+    typeof gCanvas?.document?.documentElement !== "undefined"
+      ? countDrawableObjects(gCanvas.document.documentElement)
+      : -1;
+
+  if (generationAfter <= generationBefore) {
+    hostLog("warn", "completeness:no-new-endFrame", {
+      generationBefore,
+      generationAfter,
+    });
+  }
+  if (leafCount > 0 && drawCommandCount === 0) {
+    hostLog("warn", "completeness:suspect", { leafCount, drawCommandCount });
+  }
+
+  hostLog("info", "completeness:report", {
+    endFrameGeneration: generationAfter,
+    drawCommandCount,
+    leafCount,
+    totalCommandCount: commands.length,
+  });
 
   return {
     ok: true,

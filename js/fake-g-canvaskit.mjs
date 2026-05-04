@@ -289,6 +289,8 @@ class ContextRegisterPlugin extends AbstractRendererPlugin {
   }
 }
 
+let endFrameGeneration = 0;
+
 class PatchedCanvasKitPlugin extends CanvaskitRenderer.Plugin {
   init() {
     super.init();
@@ -380,6 +382,10 @@ class PatchedCanvasKitPlugin extends CanvaskitRenderer.Plugin {
           this.restoreStack = [];
           canvas.restore();
         }
+
+        endFrameGeneration += 1;
+        globalThis.__g2EndFrameGeneration = endFrameGeneration;
+        hostLog("info", "endFrame:complete", { generation: endFrameGeneration });
       });
 
       renderingService.hooks.destroy.tap("fake-canvaskit-renderer", () => {
