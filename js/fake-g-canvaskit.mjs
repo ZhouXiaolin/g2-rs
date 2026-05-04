@@ -36,7 +36,6 @@ function patchCanvasRun() {
   }
 
   canvasProto.run = function patchedRun() {
-    hostLog("info", "patched GCanvas.run:single-frame");
     this.render({ reason: "single-frame-probe" });
     this.frameId = 0;
   };
@@ -59,12 +58,6 @@ function normalizeRectRadius(object) {
     ...object.parsedStyle,
     radius: normalized,
   };
-  hostLog("debug", "normalized rect.radius", {
-    radius,
-    normalized,
-    width: object.parsedStyle.width,
-    height: object.parsedStyle.height,
-  });
 }
 
 function normalizePaintOpacity(object) {
@@ -81,6 +74,119 @@ function normalizePaintOpacity(object) {
 
   if (changed) {
     object.parsedStyle = next;
+  }
+}
+
+function summarizeColor(value) {
+  if (!value) return value;
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.slice(0, 4);
+  if (typeof value === "object") {
+    return {
+      r: value.r,
+      g: value.g,
+      b: value.b,
+      alpha: value.alpha,
+      isNone: value.isNone,
+    };
+  }
+  return String(value);
+}
+
+function summarizePaint(paint) {
+  if (!paint || typeof paint !== "object") return null;
+  const state = paint.state || {};
+  return {
+    fakeId: paint.__fakeId || null,
+    style: typeof state.style === "string" ? state.style : null,
+    color: Array.isArray(state.color) ? state.color.slice(0, 4) : null,
+    alpha: Number.isFinite(Number(state.alpha)) ? Number(state.alpha) : null,
+    strokeWidth: Number.isFinite(Number(state.strokeWidth))
+      ? Number(state.strokeWidth)
+      : null,
+    strokeCap: typeof state.strokeCap === "string" ? state.strokeCap : null,
+    hasShader: state.shader !== undefined,
+    hasPathEffect: state.pathEffect !== undefined,
+    hasMaskFilter: state.maskFilter !== undefined,
+    stateKeys: Object.keys(state),
+  };
+}
+
+function summarizeRenderContext(context) {
+  if (!context || typeof context !== "object") return null;
+  return {
+    fillPaint: summarizePaint(context.fillPaint),
+    strokePaint: summarizePaint(context.strokePaint),
+    shadowFillPaint: summarizePaint(context.shadowFillPaint),
+    shadowStrokePaint: summarizePaint(context.shadowStrokePaint),
+  };
+}
+
+function summarizeDisplayObject(object) {
+  if (!object || typeof object !== "object") return null;
+  const style = object.parsedStyle || {};
+  return {
+    nodeName: object.nodeName || null,
+    id: object.id || null,
+    name: object.name || null,
+    className:
+      typeof object.className === "string"
+        ? object.className
+        : object.className?.toString?.() || null,
+    entity:
+      Number.isFinite(Number(object.entity)) || typeof object.entity === "string"
+        ? object.entity
+        : null,
+    type: style.type || object.type || null,
+    x1: Number.isFinite(Number(style.x1)) ? Number(style.x1) : null,
+    y1: Number.isFinite(Number(style.y1)) ? Number(style.y1) : null,
+    x2: Number.isFinite(Number(style.x2)) ? Number(style.x2) : null,
+    y2: Number.isFinite(Number(style.y2)) ? Number(style.y2) : null,
+    lineWidth: Number.isFinite(Number(style.lineWidth)) ? Number(style.lineWidth) : null,
+    lineCap: typeof style.lineCap === "string" ? style.lineCap : null,
+    opacity: Number.isFinite(Number(style.opacity)) ? Number(style.opacity) : null,
+    fillOpacity: Number.isFinite(Number(style.fillOpacity))
+      ? Number(style.fillOpacity)
+      : null,
+    strokeOpacity: Number.isFinite(Number(style.strokeOpacity))
+      ? Number(style.strokeOpacity)
+      : null,
+    visibility: style.visibility ?? null,
+    stroke: summarizeColor(style.stroke),
+    fill: summarizeColor(style.fill),
+  };
+}
+
+function pushRenderSource(object, context = null) {
+  const previousObject = globalThis.__fakeCanvasKitCurrentObject;
+  const previousPaints = globalThis.__fakeCanvasKitCurrentPaints;
+  globalThis.__fakeCanvasKitCurrentObject = summarizeDisplayObject(object);
+  globalThis.__fakeCanvasKitCurrentPaints = summarizeRenderContext(context);
+  return () => {
+    globalThis.__fakeCanvasKitCurrentObject = previousObject;
+    globalThis.__fakeCanvasKitCurrentPaints = previousPaints;
+  };
+}
+
+function patchRendererContributions(internal) {
+  const contributions = internal?.rendererContributionFactory;
+  if (!contributions || typeof contributions !== "object") return;
+
+  for (const renderer of Object.values(contributions)) {
+    if (!renderer || typeof renderer.render !== "function" || renderer.__probeWrapped) {
+      continue;
+    }
+
+    const originalRender = renderer.render;
+    renderer.render = function patchedRendererRender(object, context) {
+      const popSource = pushRenderSource(object, context);
+      try {
+        return originalRender.call(this, object, context);
+      } finally {
+        popSource();
+      }
+    };
+    renderer.__probeWrapped = true;
   }
 }
 
@@ -187,11 +293,13 @@ class PatchedCanvasKitPlugin extends CanvaskitRenderer.Plugin {
   init() {
     super.init();
     const internal = this.plugins[0];
+    patchRendererContributions(internal);
     const originalRenderDisplayObject = internal.renderDisplayObject;
 
     internal.renderDisplayObject = function patchedRenderDisplayObject(object, canvas) {
       normalizeRectRadius(object);
       normalizePaintOpacity(object);
+      const popSource = pushRenderSource(object);
       const previousTextLayout = globalThis.__fakeCanvasKitTextLayoutContext;
       if (object?.nodeName === "text") {
         globalThis.__fakeCanvasKitTextLayoutContext = {
@@ -220,6 +328,7 @@ class PatchedCanvasKitPlugin extends CanvaskitRenderer.Plugin {
         throw error;
       } finally {
         globalThis.__fakeCanvasKitTextLayoutContext = previousTextLayout;
+        popSource();
       }
     };
 
@@ -230,7 +339,6 @@ class PatchedCanvasKitPlugin extends CanvaskitRenderer.Plugin {
       renderingService.hooks.init.tap("fake-canvaskit-renderer", () => {
         const { surface } = this.context.contextService.getContext();
         const dpr = this.context.contextService.getDPR();
-        hostLog("debug", "fake renderer init", { dpr });
         surface.getCanvas().scale(dpr, dpr);
       });
 
@@ -241,7 +349,6 @@ class PatchedCanvasKitPlugin extends CanvaskitRenderer.Plugin {
         const tmpVec3 = [0, 0, 0];
         const tmpQuat = [0, 0, 0, 1];
 
-        hostLog("debug", "fake renderer endFrame:begin");
         try {
           canvas.save();
           this.applyCamera(canvas, this.context.camera, tmpVec3, tmpQuat);
@@ -272,7 +379,6 @@ class PatchedCanvasKitPlugin extends CanvaskitRenderer.Plugin {
           this.restoreStack.forEach(() => canvas.restore());
           this.restoreStack = [];
           canvas.restore();
-          hostLog("debug", "fake renderer endFrame:done");
         }
       });
 

@@ -333,7 +333,7 @@
   var document = new Document();
   var rafId = 1;
   var rafCount = 0;
-  var maxRafCallbacks = 256;
+  var maxRafCallbacks = 8192;
   var hostConsoleEntries = [];
 
   function ensureContainer(id) {

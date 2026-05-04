@@ -13,8 +13,38 @@ const commands = [];
 let nextId = 1;
 const MAX_TRACE = 2000;
 const MAX_COMMANDS = 10000;
-const MAX_HOST_LOG = 200;
-let hostLogCount = 0;
+
+function cloneTaggedValue(value, depth = 0, seen = new WeakSet()) {
+  if (value === null || value === undefined) return value;
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+  if (depth >= 4) return null;
+  if (Array.isArray(value)) {
+    return value.slice(0, 24).map((item) => cloneTaggedValue(item, depth + 1, seen));
+  }
+  if (typeof value !== "object") return String(value);
+  if (seen.has(value)) return "[Circular]";
+  seen.add(value);
+
+  const out = {};
+  for (const [key, item] of Object.entries(value).slice(0, 24)) {
+    out[key] = cloneTaggedValue(item, depth + 1, seen);
+  }
+  return out;
+}
+
+function snapshotCurrentSource() {
+  const source = globalThis.__fakeCanvasKitCurrentObject;
+  if (!source || typeof source !== "object") return null;
+  return cloneTaggedValue(source);
+}
+
+function snapshotCurrentPaints() {
+  const paints = globalThis.__fakeCanvasKitCurrentPaints;
+  if (!paints || typeof paints !== "object") return null;
+  return cloneTaggedValue(paints);
+}
 
 function record(name, args) {
   const entry = {
@@ -23,10 +53,6 @@ function record(name, args) {
     args: Array.from(args || []).map((value) => serializeArg(value)),
   };
   if (trace.length < MAX_TRACE) trace.push(entry);
-  if (hostLogCount < MAX_HOST_LOG) {
-    hostLogCount += 1;
-    hostLog("debug", `[fake-canvaskit] ${name}`, entry.args);
-  }
   return entry;
 }
 
@@ -34,6 +60,8 @@ function recordCommand(kind, payload = {}) {
   const entry = {
     index: commands.length,
     kind,
+    source: snapshotCurrentSource(),
+    sourcePaints: snapshotCurrentPaints(),
     ...payload,
   };
   if (commands.length < MAX_COMMANDS) commands.push(entry);
@@ -522,12 +550,7 @@ class FakePath {
 
   transform(matrix) {
     record("Path.transform", [matrix]);
-    if (shouldSkipDuplicatePathTranslate(this.ops, matrix)) {
-      hostLog("debug", "Path.transform:skip-duplicate-translate", {
-        matrix,
-      });
-      return this;
-    }
+    if (shouldSkipDuplicatePathTranslate(this.ops, matrix)) return this;
     this.ops.push(["transform", matrix]);
     return this;
   }
@@ -1134,7 +1157,10 @@ export function createFakeCanvasKitInit() {
   return function fakeCanvasKitInit(options = {}) {
     trace.length = 0;
     commands.length = 0;
-    hostLogCount = 0;
+    nextId = 1;
+    globalThis.__fakeCanvasKitCurrentObject = null;
+    globalThis.__fakeCanvasKitCurrentPaints = null;
+    globalThis.__fakeCanvasKitTextLayoutContext = null;
     record("CanvasKitInit", [options]);
     const kit = createFakeCanvasKit();
     globalThis.__fakeCanvasKit = kit;

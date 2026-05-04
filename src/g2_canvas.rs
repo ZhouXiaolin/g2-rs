@@ -73,6 +73,89 @@ pub struct PaintSnapshot {
     pub path_effect: Option<PathEffectSnapshot>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CommandMeta {
+    #[serde(default)]
+    pub source: Option<CommandSource>,
+    #[serde(default)]
+    #[serde(rename = "sourcePaints")]
+    pub source_paints: Option<SourcePaintsSnapshot>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum CommandSource {
+    Object(DisplayObjectSnapshot),
+    Text(String),
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SourcePaintsSnapshot {
+    #[serde(default)]
+    #[serde(rename = "fillPaint")]
+    pub fill_paint: Option<PaintSnapshot>,
+    #[serde(default)]
+    #[serde(rename = "strokePaint")]
+    pub stroke_paint: Option<PaintSnapshot>,
+    #[serde(default)]
+    #[serde(rename = "shadowFillPaint")]
+    pub shadow_fill_paint: Option<PaintSnapshot>,
+    #[serde(default)]
+    #[serde(rename = "shadowStrokePaint")]
+    pub shadow_stroke_paint: Option<PaintSnapshot>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DisplayObjectSnapshot {
+    #[serde(default)]
+    #[serde(rename = "nodeName")]
+    pub node_name: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "lineWidth")]
+    pub line_width: Option<f32>,
+    #[serde(default)]
+    #[serde(rename = "lineCap")]
+    pub line_cap: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "lineJoin")]
+    pub line_join: Option<String>,
+    #[serde(default)]
+    pub opacity: Option<f32>,
+    #[serde(default)]
+    #[serde(rename = "fillOpacity")]
+    pub fill_opacity: Option<f32>,
+    #[serde(default)]
+    #[serde(rename = "strokeOpacity")]
+    pub stroke_opacity: Option<f32>,
+    #[serde(default)]
+    pub stroke: Option<SourceColorSnapshot>,
+    #[serde(default)]
+    pub fill: Option<SourceColorSnapshot>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum SourceColorSnapshot {
+    Object(SourceColorObject),
+    Array([f32; 4]),
+    Text(String),
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SourceColorObject {
+    #[serde(default)]
+    pub r: Option<f32>,
+    #[serde(default)]
+    pub g: Option<f32>,
+    #[serde(default)]
+    pub b: Option<f32>,
+    #[serde(default)]
+    pub alpha: Option<f32>,
+    #[serde(default)]
+    #[serde(rename = "isNone")]
+    pub is_none: Option<bool>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PathEffectSnapshot {
     pub kind: String,
@@ -113,22 +196,30 @@ pub enum G2CanvasCommand {
     },
     #[serde(rename = "drawRect")]
     DrawRect {
+        #[serde(flatten)]
+        meta: CommandMeta,
         rect: Vec<f32>,
         paint: Option<PaintSnapshot>,
     },
     #[serde(rename = "drawRRect")]
     DrawRRect {
+        #[serde(flatten)]
+        meta: CommandMeta,
         rrect: Vec<f32>,
         paint: Option<PaintSnapshot>,
     },
     #[serde(rename = "drawPath")]
     DrawPath {
+        #[serde(flatten)]
+        meta: CommandMeta,
         #[serde(default)]
         path: Vec<Vec<Value>>,
         paint: Option<PaintSnapshot>,
     },
     #[serde(rename = "drawLine")]
     DrawLine {
+        #[serde(flatten)]
+        meta: CommandMeta,
         x1: f32,
         y1: f32,
         x2: f32,
@@ -137,6 +228,8 @@ pub enum G2CanvasCommand {
     },
     #[serde(rename = "drawCircle")]
     DrawCircle {
+        #[serde(flatten)]
+        meta: CommandMeta,
         cx: f32,
         cy: f32,
         r: f32,
@@ -144,6 +237,8 @@ pub enum G2CanvasCommand {
     },
     #[serde(rename = "drawOval")]
     DrawOval {
+        #[serde(flatten)]
+        meta: CommandMeta,
         rect: Vec<f32>,
         paint: Option<PaintSnapshot>,
     },
@@ -274,50 +369,51 @@ fn replay_command(
                 canvas.clip_path(&path, None, Some(true));
             }
         }
-        G2CanvasCommand::DrawRect { rect, paint } => {
-            if let (Some(rect), Some(paint)) = (to_rect(rect), paint.as_ref()) {
-                if let Some(paint) = build_paint(paint)? {
+        G2CanvasCommand::DrawRect { meta, rect, paint } => {
+            if let Some(rect) = to_rect(rect) {
+                if let Some(paint) = resolve_paint(paint.as_ref(), Some(meta), PaintPreference::Auto)?
+                {
                     canvas.draw_rect(rect, &paint);
                 }
             }
         }
-        G2CanvasCommand::DrawRRect { rrect, paint } => {
-            if let (Some(rrect), Some(paint)) = (to_rrect(rrect), paint.as_ref()) {
-                if let Some(paint) = build_paint(paint)? {
+        G2CanvasCommand::DrawRRect { meta, rrect, paint } => {
+            if let Some(rrect) = to_rrect(rrect) {
+                if let Some(paint) = resolve_paint(paint.as_ref(), Some(meta), PaintPreference::Auto)?
+                {
                     canvas.draw_rrect(&rrect, &paint);
                 }
             }
         }
-        G2CanvasCommand::DrawPath { path, paint } => {
-            if let (Some(path), Some(paint)) = (build_path(path), paint.as_ref()) {
-                if let Some(paint) = build_paint(paint)? {
+        G2CanvasCommand::DrawPath { meta, path, paint } => {
+            if let Some(path) = build_path(path) {
+                if let Some(paint) = resolve_paint(paint.as_ref(), Some(meta), PaintPreference::Auto)?
+                {
                     canvas.draw_path(&path, &paint);
                 }
             }
         }
         G2CanvasCommand::DrawLine {
+            meta,
             x1,
             y1,
             x2,
             y2,
             paint,
         } => {
-            if let Some(paint) = paint.as_ref() {
-                if let Some(paint) = build_paint(paint)? {
-                    canvas.draw_line((*x1, *y1), (*x2, *y2), &paint);
-                }
+            if let Some(paint) = resolve_paint(paint.as_ref(), Some(meta), PaintPreference::Stroke)? {
+                canvas.draw_line((*x1, *y1), (*x2, *y2), &paint);
             }
         }
-        G2CanvasCommand::DrawCircle { cx, cy, r, paint } => {
-            if let Some(paint) = paint.as_ref() {
-                if let Some(paint) = build_paint(paint)? {
+        G2CanvasCommand::DrawCircle { meta, cx, cy, r, paint } => {
+            if let Some(paint) = resolve_paint(paint.as_ref(), Some(meta), PaintPreference::Auto)? {
                     canvas.draw_circle((*cx, *cy), *r, &paint);
-                }
             }
         }
-        G2CanvasCommand::DrawOval { rect, paint } => {
-            if let (Some(rect), Some(paint)) = (to_rect(rect), paint.as_ref()) {
-                if let Some(paint) = build_paint(paint)? {
+        G2CanvasCommand::DrawOval { meta, rect, paint } => {
+            if let Some(rect) = to_rect(rect) {
+                if let Some(paint) = resolve_paint(paint.as_ref(), Some(meta), PaintPreference::Auto)?
+                {
                     canvas.draw_oval(rect, &paint);
                 }
             }
@@ -408,6 +504,115 @@ fn build_paint(snapshot: &PaintSnapshot) -> Result<Option<Paint>, G2ReplayError>
     }
 
     Ok(Some(paint))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaintPreference {
+    Auto,
+    Fill,
+    Stroke,
+}
+
+fn resolve_paint(
+    primary: Option<&PaintSnapshot>,
+    meta: Option<&CommandMeta>,
+    default_preference: PaintPreference,
+) -> Result<Option<Paint>, G2ReplayError> {
+    if let Some(primary) = primary {
+        if let Some(paint) = build_paint(primary)? {
+            return Ok(Some(paint));
+        }
+    }
+
+    let preference = primary
+        .and_then(|paint| infer_preference_from_snapshot(paint))
+        .or_else(|| meta.and_then(infer_preference_from_meta))
+        .unwrap_or(default_preference);
+
+    if let Some(meta) = meta {
+        for snapshot in fallback_paint_snapshots(meta, preference) {
+            if let Some(paint) = build_paint(snapshot)? {
+                return Ok(Some(paint));
+            }
+        }
+        if let Some(snapshot) = source_style_paint_snapshot(meta, preference) {
+            if let Some(paint) = build_paint(&snapshot)? {
+                return Ok(Some(paint));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn infer_preference_from_snapshot(snapshot: &PaintSnapshot) -> Option<PaintPreference> {
+    match snapshot.style.as_deref() {
+        Some("fill") => Some(PaintPreference::Fill),
+        Some("stroke") => Some(PaintPreference::Stroke),
+        _ => None,
+    }
+}
+
+fn infer_preference_from_meta(meta: &CommandMeta) -> Option<PaintPreference> {
+    let paints = meta.source_paints.as_ref()?;
+    match (
+        paints.fill_paint.is_some(),
+        paints.stroke_paint.is_some(),
+    ) {
+        (true, false) => Some(PaintPreference::Fill),
+        (false, true) => Some(PaintPreference::Stroke),
+        _ => None,
+    }
+}
+
+fn fallback_paint_snapshots<'a>(
+    meta: &'a CommandMeta,
+    preference: PaintPreference,
+) -> Vec<&'a PaintSnapshot> {
+    let mut out = Vec::new();
+    let Some(paints) = meta.source_paints.as_ref() else {
+        return out;
+    };
+
+    match preference {
+        PaintPreference::Fill => {
+            if let Some(fill) = paints.fill_paint.as_ref() {
+                out.push(fill);
+            }
+        }
+        PaintPreference::Stroke => {
+            if let Some(stroke) = paints.stroke_paint.as_ref() {
+                out.push(stroke);
+            }
+        }
+        PaintPreference::Auto => match (
+            paints.fill_paint.as_ref(),
+            paints.stroke_paint.as_ref(),
+        ) {
+            (Some(fill), None) => out.push(fill),
+            (None, Some(stroke)) => out.push(stroke),
+            _ => {}
+        },
+    }
+
+    out
+}
+
+fn source_style_paint_snapshot(meta: &CommandMeta, preference: PaintPreference) -> Option<PaintSnapshot> {
+    let source = match meta.source.as_ref()? {
+        CommandSource::Object(source) => source,
+        CommandSource::Text(_) => return None,
+    };
+
+    match preference {
+        PaintPreference::Fill => source.fill_snapshot(),
+        PaintPreference::Stroke => source.stroke_snapshot(),
+        PaintPreference::Auto => match (source.fill_snapshot(), source.stroke_snapshot()) {
+            (Some(fill), None) => Some(fill),
+            (None, Some(stroke)) => Some(stroke),
+            _ => None,
+        },
+    }
 }
 
 fn build_path_effect(snapshot: &PaintSnapshot) -> Result<Option<PathEffect>, G2ReplayError> {
@@ -700,4 +905,86 @@ fn default_text_align() -> String {
 
 fn default_text_direction() -> String {
     "ltr".into()
+}
+
+impl DisplayObjectSnapshot {
+    fn fill_snapshot(&self) -> Option<PaintSnapshot> {
+        let color = source_color_to_rgba(self.fill.as_ref()?)?;
+        let opacity = self.opacity.unwrap_or(1.0).clamp(0.0, 1.0);
+        let fill_opacity = self.fill_opacity.unwrap_or(1.0).clamp(0.0, 1.0);
+        let alpha = color[3] * opacity * fill_opacity;
+        if alpha <= 0.0 {
+            return None;
+        }
+
+        Some(PaintSnapshot {
+            style: Some("fill".into()),
+            color: Some([color[0], color[1], color[2], alpha]),
+            stroke_width: None,
+            stroke_cap: None,
+            stroke_join: self.line_join.clone(),
+            stroke_miter: None,
+            alpha: None,
+            has_shader: false,
+            has_path_effect: false,
+            has_mask_filter: false,
+            path_effect: None,
+        })
+    }
+
+    fn stroke_snapshot(&self) -> Option<PaintSnapshot> {
+        let color = source_color_to_rgba(self.stroke.as_ref()?)?;
+        let stroke_width = self.line_width.unwrap_or(1.0).max(0.0);
+        if stroke_width <= 0.0 {
+            return None;
+        }
+
+        let opacity = self.opacity.unwrap_or(1.0).clamp(0.0, 1.0);
+        let stroke_opacity = self.stroke_opacity.unwrap_or(1.0).clamp(0.0, 1.0);
+        let alpha = color[3] * opacity * stroke_opacity;
+        if alpha <= 0.0 {
+            return None;
+        }
+
+        Some(PaintSnapshot {
+            style: Some("stroke".into()),
+            color: Some([color[0], color[1], color[2], alpha]),
+            stroke_width: Some(stroke_width),
+            stroke_cap: self.line_cap.clone(),
+            stroke_join: self.line_join.clone(),
+            stroke_miter: None,
+            alpha: None,
+            has_shader: false,
+            has_path_effect: false,
+            has_mask_filter: false,
+            path_effect: None,
+        })
+    }
+}
+
+fn source_color_to_rgba(source: &SourceColorSnapshot) -> Option<[f32; 4]> {
+    match source {
+        SourceColorSnapshot::Object(color) => {
+            if color.is_none.unwrap_or(false) {
+                return None;
+            }
+            let r = color.r?.clamp(0.0, 255.0) / 255.0;
+            let g = color.g?.clamp(0.0, 255.0) / 255.0;
+            let b = color.b?.clamp(0.0, 255.0) / 255.0;
+            let a = color.alpha.unwrap_or(1.0).clamp(0.0, 1.0);
+            Some([r, g, b, a])
+        }
+        SourceColorSnapshot::Array(color) => Some(normalized_color(*color)),
+        SourceColorSnapshot::Text(text) => parse_named_source_color(text),
+    }
+}
+
+fn parse_named_source_color(text: &str) -> Option<[f32; 4]> {
+    let value = text.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "" | "none" | "transparent" => None,
+        "black" => Some([0.0, 0.0, 0.0, 1.0]),
+        "white" => Some([1.0, 1.0, 1.0, 1.0]),
+        _ => None,
+    }
 }

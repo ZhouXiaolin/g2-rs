@@ -10,6 +10,7 @@ use skia_safe::font_style::{Slant, Weight, Width};
 use skia_safe::{Font, FontMgr, FontStyle};
 
 const G2_HOST_RUNTIME: &str = include_str!("g2_host_runtime.js");
+const DEFAULT_G2_SCRIPT: &str = include_str!("../examples/g2-stacked-area.js");
 
 #[derive(Debug, Clone)]
 pub struct ProbeLog {
@@ -23,6 +24,24 @@ pub struct G2ProbeReport {
     pub result_json: Option<String>,
     pub error: Option<String>,
     pub logs: Vec<ProbeLog>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct G2RunOptions {
+    pub width: u32,
+    pub height: u32,
+    #[serde(rename = "containerId")]
+    pub container_id: String,
+}
+
+impl Default for G2RunOptions {
+    fn default() -> Self {
+        Self {
+            width: 960,
+            height: 540,
+            container_id: "container".into(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -76,16 +95,32 @@ impl G2Probe {
     }
 
     pub fn run_sample_chart(&self) -> Result<G2ProbeReport, G2ProbeError> {
+        self.run_script(DEFAULT_G2_SCRIPT, &G2RunOptions::default())
+    }
+
+    pub fn run_script(
+        &self,
+        script_source: &str,
+        options: &G2RunOptions,
+    ) -> Result<G2ProbeReport, G2ProbeError> {
         self.clear_logs();
 
         self.context.with(|ctx| {
-            let script = r#"
-                (async function () {
-                  return JSON.stringify(await globalThis.runG2Probe());
-                })()
-            "#;
+            let options_json = serde_json::to_string(options)
+                .map_err(|e| G2ProbeError::Js(format!("failed to serialize options: {e}")))?;
+            let script = format!(
+                r#"
+                (async function () {{
+                  return JSON.stringify(
+                    await globalThis.runG2Probe({}, {})
+                  );
+                }})()
+            "#,
+                json_escape(script_source),
+                options_json
+            );
 
-            let promise = match ctx.eval::<MaybePromise<'_>, _>(script) {
+            let promise = match ctx.eval::<MaybePromise<'_>, _>(script.as_str()) {
                 Ok(promise) => promise,
                 Err(rquickjs::Error::Exception) => {
                     return Ok(G2ProbeReport {
@@ -113,6 +148,34 @@ impl G2Probe {
                 },
                 Err(rquickjs::Error::WouldBlock) => {
                     let mut logs = self.snapshot_logs();
+                    if let Some(result_json) = eval_string(
+                        &ctx,
+                        format!(
+                            r#"
+                            JSON.stringify(
+                              globalThis.collectCurrentG2ProbeState
+                                ? globalThis.collectCurrentG2ProbeState({})
+                                : null
+                            )
+                            "#,
+                            options_json
+                        )
+                        .as_str(),
+                    ) {
+                        if result_json != "null" {
+                            logs.push(ProbeLog {
+                                level: "warn".into(),
+                                message:
+                                    "render promise did not settle; using current static frame".into(),
+                            });
+                            return Ok(G2ProbeReport {
+                                ok: true,
+                                result_json: Some(result_json),
+                                error: None,
+                                logs,
+                            });
+                        }
+                    }
                     if let Some(trace_tail) = eval_string(
                         &ctx,
                         r#"
@@ -225,6 +288,26 @@ fn g2_bundle_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("js")
         .join("g2-bundle.js")
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn eval_string(ctx: &rquickjs::Ctx<'_>, script: &str) -> Option<String> {
