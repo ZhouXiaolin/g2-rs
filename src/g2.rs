@@ -4,6 +4,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use crate::json_escape;
+
 use rquickjs::{promise::MaybePromise, Context, FromJs, Function, Runtime};
 use serde::Serialize;
 use skia_safe::font_style::{Slant, Weight, Width};
@@ -288,26 +290,6 @@ fn g2_bundle_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("js")
         .join("g2-bundle.js")
-}
-
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 fn eval_string(ctx: &rquickjs::Ctx<'_>, script: &str) -> Option<String> {

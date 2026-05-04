@@ -430,7 +430,9 @@
       return id;
     }
     rafCount += 1;
-    if (typeof callback === "function") callback(Date.now());
+    Promise.resolve().then(function () {
+      if (typeof callback === "function") callback(Date.now());
+    });
     return id;
   };
   globalThis.cancelAnimationFrame = function () {};

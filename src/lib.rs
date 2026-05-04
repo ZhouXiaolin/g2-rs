@@ -7,6 +7,26 @@ const MATHJAX_BUNDLE: &str = include_str!("../js/mathjax-bundle.js");
 mod g2;
 mod g2_canvas;
 
+pub(crate) fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 pub use g2::{G2Probe, G2ProbeError, G2ProbeReport, G2RunOptions, ProbeLog};
 pub use g2_canvas::{
     render_scene_to_png, scene_from_json, G2CanvasCommand, G2ReplayError, G2Scene, G2ScenePayload,
@@ -83,26 +103,6 @@ impl MathRenderer {
         let svg_str = self.tex_to_svg(latex, display)?;
         svg_to_png(&svg_str, scale)
     }
-}
-
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 pub fn svg_to_png(svg_str: &str, scale: f32) -> Result<Vec<u8>, RenderError> {

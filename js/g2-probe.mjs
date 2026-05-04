@@ -164,7 +164,7 @@ async function waitForRenderableState(chart) {
   if (chart.__probeRenderPromise) {
     await chart.__probeRenderPromise;
   }
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 32; i++) {
     await Promise.resolve();
   }
 }

@@ -86441,7 +86441,7 @@
     if (chart.__probeRenderPromise) {
       await chart.__probeRenderPromise;
     }
-    for (let i2 = 0; i2 < 4; i2++) {
+    for (let i2 = 0; i2 < 32; i2++) {
       await Promise.resolve();
     }
   }
