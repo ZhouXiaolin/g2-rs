@@ -1,15 +1,15 @@
 {
-  "name": "mathjax-bundle",
+  "name": "g2-rs-bundle",
   "private": true,
   "scripts": {
-    "build:g2": "esbuild g2-probe.mjs --bundle --format=iife --platform=browser --target=es2020 --alias:path=./shims/path.js --alias:fs=./shims/fs.js --outfile=g2-bundle.js"
+    "build:g2": "esbuild g2-probe.mjs --bundle --format=iife --platform=browser --target=es2020 --alias:path=./shims/path.js --alias:fs=./shims/fs.js --outfile=g2-bundle.js && node patch-bundle.mjs"
   },
   "dependencies": {
     "@antv/g-canvaskit": "^1.1.1",
-    "@antv/g2": "^5.4.8",
-    "mathjax-full": "3.2.2"
+    "@antv/g2": "^5.4.8"
   },
   "devDependencies": {
-    "esbuild": "^0.25.0"
+    "esbuild": "^0.25.0",
+    "pngjs": "^7.0.0"
   }
 }

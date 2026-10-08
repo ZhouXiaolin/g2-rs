@@ -1,10 +1,10 @@
 [package]
-name = "katextest"
+name = "g2-rs"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-resvg = "0.47.0"
+base64 = "0.22"
 rquickjs = "0.11.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

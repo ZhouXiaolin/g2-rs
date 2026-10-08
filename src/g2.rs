@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::Read,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -261,6 +262,72 @@ fn install_logger<'js>(
         .map_err(|e| G2ProbeError::Js(e.to_string()))?;
     globals
         .set(
+            "__rust_fetch_base64",
+            Function::new(ctx.clone(), move |url: String| {
+                fetch_base64(&url).map_err(|error| {
+                    rquickjs::Error::new_from_js_message("rustFetchBase64", "string", error)
+                })
+            })
+            .map_err(|e| G2ProbeError::Js(e.to_string()))?,
+        )
+        .map_err(|e| G2ProbeError::Js(e.to_string()))?;
+    globals
+        .set(
+            "__rust_image_size",
+            Function::new(ctx.clone(), move |encoded: String| {
+                image_size(&encoded).map_err(|error| {
+                    rquickjs::Error::new_from_js_message("rustImageSize", "string", error)
+                })
+            })
+            .map_err(|e| G2ProbeError::Js(e.to_string()))?,
+        )
+        .map_err(|e| G2ProbeError::Js(e.to_string()))?;
+    globals
+        .set(
+            "__rust_encode_png",
+            Function::new(ctx.clone(), move |rgba: String, width: u32, height: u32| {
+                encode_png(&rgba, width, height).map_err(|error| {
+                    rquickjs::Error::new_from_js_message("rustEncodePng", "string", error)
+                })
+            })
+            .map_err(|e| G2ProbeError::Js(e.to_string()))?,
+        )
+        .map_err(|e| G2ProbeError::Js(e.to_string()))?;
+    globals
+        .set(
+            "__rust_image_rgba",
+            Function::new(ctx.clone(), move |encoded: String| {
+                image_rgba(&encoded).map_err(|error| {
+                    rquickjs::Error::new_from_js_message("rustImageRgba", "string", error)
+                })
+            })
+            .map_err(|e| G2ProbeError::Js(e.to_string()))?,
+        )
+        .map_err(|e| G2ProbeError::Js(e.to_string()))?;
+    globals
+        .set(
+            "__rust_draw_text",
+            Function::new(ctx.clone(), move |args: String| {
+                draw_text_json(&args).map_err(|error| {
+                    rquickjs::Error::new_from_js_message("rustDrawText", "string", error)
+                })
+            })
+            .map_err(|e| G2ProbeError::Js(e.to_string()))?,
+        )
+        .map_err(|e| G2ProbeError::Js(e.to_string()))?;
+    globals
+        .set(
+            "__rust_rasterize_pattern",
+            Function::new(ctx.clone(), move |args: String| {
+                rasterize_pattern(&args).map_err(|error| {
+                    rquickjs::Error::new_from_js_message("rustRasterizePattern", "string", error)
+                })
+            })
+            .map_err(|e| G2ProbeError::Js(e.to_string()))?,
+        )
+        .map_err(|e| G2ProbeError::Js(e.to_string()))?;
+    globals
+        .set(
             "__rust_measure_text",
             Function::new(
                 ctx.clone(),
@@ -303,6 +370,331 @@ fn fetch_text(url: &str) -> Result<String, String> {
     response
         .into_string()
         .map_err(|error| format!("failed to read response body for {url}: {error}"))
+}
+
+fn fetch_base64(url: &str) -> Result<String, String> {
+    use base64::Engine as _;
+    let response = ureq::get(url)
+        .call()
+        .map_err(|error| format!("fetch failed for {url}: {error}"))?;
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("failed to read response body for {url}: {error}"))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+/// PNG IHDR / JPEG SOF header scan; returns {"width":w,"height":h} or 1x1 fallback
+/// (only used for naturalWidth/Height defaults — layout sizes come from the spec).
+fn image_size(encoded: &str) -> Result<String, String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .map_err(|error| format!("bad base64 image: {error}"))?;
+    let (width, height) = sniff_png(&bytes)
+        .or_else(|| sniff_jpeg(&bytes))
+        .unwrap_or((1, 1));
+    Ok(format!("{{\"width\":{width},\"height\":{height}}}"))
+}
+
+fn sniff_png(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 24 || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return None;
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+    let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+    Some((width, height))
+}
+
+fn sniff_jpeg(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
+        return None;
+    }
+    let mut i = 2;
+    while i + 9 < bytes.len() {
+        if bytes[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        let marker = bytes[i + 1];
+        // SOF0-SOF3 (excluding DHT/JPG/DAC), also SOF5-7, SOF9-11
+        if matches!(marker, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF) {
+            let height = u16::from_be_bytes(bytes[i + 5..i + 7].try_into().ok()?) as u32;
+            let width = u16::from_be_bytes(bytes[i + 7..i + 9].try_into().ok()?) as u32;
+            return Some((width, height));
+        }
+        if matches!(marker, 0xD8 | 0x01) || (0xD0..=0xD7).contains(&marker) {
+            i += 2;
+            continue;
+        }
+        let len = u16::from_be_bytes(bytes[i + 2..i + 4].try_into().ok()?) as usize;
+        i += 2 + len;
+    }
+    None
+}
+
+/// straight-RGBA base64 -> PNG data URL body (base64). Used by the JS-side 2D
+/// rasterizer for canvas.toDataURL().
+fn encode_png(rgba: &str, width: u32, height: u32) -> Result<String, String> {
+    use base64::Engine as _;
+    use skia_safe::{images, AlphaType, ColorType, ImageInfo};
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(rgba.trim())
+        .map_err(|error| format!("bad base64 rgba: {error}"))?;
+    let info = ImageInfo::new(
+        (width as i32, height as i32),
+        ColorType::RGBA8888,
+        AlphaType::Unpremul,
+        None,
+    );
+    if bytes.len() < info.bytes_per_pixel() * width as usize * height as usize {
+        return Err("rgba buffer too small".into());
+    }
+    let image = images::raster_from_data(&info, skia_safe::Data::new_copy(&bytes), info.min_row_bytes())
+        .ok_or("failed to build raster image")?;
+    let png = image
+        .encode_to_data(skia_safe::EncodedImageFormat::PNG)
+        .ok_or("png encode failed")?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(png.as_bytes()))
+}
+
+/// RGBA canvas + text draw request -> RGBA canvas with the text rasterized
+/// (black-on-red scan by g-lite's font metrics needs real glyphs).
+#[derive(serde::Deserialize)]
+struct DrawTextArgs {
+    rgba: String,
+    width: u32,
+    height: u32,
+    text: String,
+    x: f64,
+    y: f64,
+    #[serde(default = "default_font_size")]
+    font_size: f32,
+    #[serde(default)]
+    font_families: String,
+    #[serde(default)]
+    font_weight: i32,
+    #[serde(default)]
+    italic: bool,
+    #[serde(default = "default_color_channel")]
+    r: u8,
+    #[serde(default = "default_color_channel")]
+    g: u8,
+    #[serde(default = "default_color_channel")]
+    b: u8,
+    #[serde(default = "default_alpha")]
+    a: f64,
+}
+
+fn default_font_size() -> f32 {
+    12.0
+}
+
+fn default_color_channel() -> u8 {
+    0
+}
+
+fn default_alpha() -> f64 {
+    1.0
+}
+
+fn draw_text_json(args: &str) -> Result<String, String> {
+    let parsed: DrawTextArgs =
+        serde_json::from_str(args).map_err(|error| format!("bad draw_text args: {error}"))?;
+    draw_text(
+        &parsed.rgba,
+        parsed.width,
+        parsed.height,
+        &parsed.text,
+        parsed.x,
+        parsed.y,
+        parsed.font_size,
+        &parsed.font_families,
+        parsed.font_weight,
+        parsed.italic,
+        parsed.r,
+        parsed.g,
+        parsed.b,
+        parsed.a,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_text(
+    rgba: &str,
+    width: u32,
+    height: u32,
+    text: &str,
+    x: f64,
+    y: f64,
+    font_size: f32,
+    font_families: &str,
+    font_weight: i32,
+    italic: bool,
+    r: u8,
+    g: u8,
+    b: u8,
+    a: f64,
+) -> Result<String, String> {
+    use base64::Engine as _;
+    use skia_safe::{surfaces, AlphaType, Color, ColorType, Font, ImageInfo, Paint};
+    use skia_safe::font_style::{Slant, Weight, Width};
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(rgba.trim())
+        .map_err(|error| format!("bad base64 rgba: {error}"))?;
+    let info = ImageInfo::new(
+        (width as i32, height as i32),
+        ColorType::RGBA8888,
+        AlphaType::Unpremul,
+        None,
+    );
+    if bytes.len() < info.min_row_bytes() * height as usize {
+        return Err("rgba buffer too small".into());
+    }
+    let mut surface =
+        surfaces::raster(&info, None, None).ok_or_else(|| "failed to create surface".to_string())?;
+    surface
+        .canvas()
+        .write_pixels(&info, &bytes, info.min_row_bytes(), (0, 0));
+
+    let font_size = font_size.max(1.0);
+    let style = FontStyle::new(
+        Weight::from(font_weight.clamp(*Weight::THIN, *Weight::EXTRA_BLACK)),
+        Width::NORMAL,
+        if italic { Slant::Italic } else { Slant::Upright },
+    );
+    let font_mgr = FontMgr::default();
+    let typeface = pick_typeface(&font_mgr, font_families, style)
+        .or_else(|| font_mgr.legacy_make_typeface(None, style));
+    let mut font = match typeface {
+        Some(typeface) => Font::new(typeface, font_size),
+        None => Font::default(),
+    };
+    font.set_size(font_size);
+    font.set_subpixel(true);
+    font.set_hinting(skia_safe::FontHinting::None);
+
+    let mut paint = Paint::default();
+    paint.set_anti_alias(true);
+    paint.set_color(Color::from_argb(
+        (a.clamp(0.0, 1.0) * 255.0).round() as u8,
+        r,
+        g,
+        b,
+    ));
+    surface
+        .canvas()
+        .draw_str(text, (x as f32, y as f32), &font, &paint);
+
+    let mut out = vec![0u8; info.min_row_bytes() * height as usize];
+    let _ = surface.read_pixels(&info, &mut out, info.min_row_bytes(), (0, 0));
+    Ok(base64::engine::general_purpose::STANDARD.encode(out))
+}
+
+#[derive(serde::Deserialize)]
+struct PatternArgs {
+    width: u32,
+    height: u32,
+    #[serde(default)]
+    fill: Option<Vec<f64>>,
+    #[serde(default)]
+    lines: Vec<Vec<f64>>,
+    #[serde(default = "default_line_width")]
+    line_width: f64,
+    #[serde(default)]
+    stroke: Option<Vec<f64>>,
+    #[serde(default = "default_stroke_opacity")]
+    stroke_opacity: f64,
+}
+
+fn default_line_width() -> f64 {
+    1.0
+}
+
+fn default_stroke_opacity() -> f64 {
+    1.0
+}
+
+/// Tile pattern for g-element rect+path fills: solid fill + stroked polylines,
+/// antialiased by skia like the browser baseline. Returns straight-RGBA base64.
+fn rasterize_pattern(args: &str) -> Result<String, String> {
+    use base64::Engine as _;
+    use skia_safe::{surfaces, AlphaType, Color, ColorType, Paint, PaintStyle};
+    let parsed: PatternArgs =
+        serde_json::from_str(args).map_err(|error| format!("bad pattern args: {error}"))?;
+    let width = parsed.width.max(1);
+    let height = parsed.height.max(1);
+    let info = skia_safe::ImageInfo::new(
+        (width as i32, height as i32),
+        ColorType::RGBA8888,
+        AlphaType::Unpremul,
+        None,
+    );
+    let mut surface =
+        surfaces::raster(&info, None, None).ok_or_else(|| "failed to create surface".to_string())?;
+    if let Some(fill) = &parsed.fill {
+        let mut paint = Paint::default();
+        paint.set_anti_alias(false);
+        paint.set_color(pattern_color(fill, 1.0));
+        surface.canvas().draw_rect(
+            skia_safe::Rect::from_ltrb(0.0, 0.0, width as f32, height as f32),
+            &paint,
+        );
+    }
+    if let Some(stroke) = &parsed.stroke {
+        let mut builder = skia_safe::PathBuilder::new();
+        for line in &parsed.lines {
+            if line.len() < 4 {
+                continue;
+            }
+            // each segment is its own subpath — chaining would draw bogus connectors
+            builder.move_to((line[0] as f32, line[1] as f32));
+            builder.line_to((line[2] as f32, line[3] as f32));
+        }
+        let path = builder.detach();
+        let mut paint = Paint::default();
+        paint.set_anti_alias(true);
+        paint.set_style(PaintStyle::Stroke);
+        paint.set_stroke_width(parsed.line_width as f32);
+        paint.set_color(pattern_color(stroke, parsed.stroke_opacity));
+        surface.canvas().draw_path(&path, &paint);
+    }
+    let mut out = vec![0u8; info.min_row_bytes() * height as usize];
+    let _ = surface.read_pixels(&info, &mut out, info.min_row_bytes(), (0, 0));
+    Ok(base64::engine::general_purpose::STANDARD.encode(out))
+}
+
+fn pattern_color(rgba: &[f64], extra_alpha: f64) -> skia_safe::Color {
+    let channel = |i: usize| -> u8 { (rgba.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0) * 255.0).round() as u8 };
+    let a = rgba
+        .get(3)
+        .copied()
+        .unwrap_or(1.0)
+        .clamp(0.0, 1.0)
+        * extra_alpha.clamp(0.0, 1.0);
+    skia_safe::Color::from_argb((a * 255.0).round() as u8, channel(0), channel(1), channel(2))
+}
+
+/// encoded image base64 (PNG/JPEG) -> JSON {width,height,rgba} straight RGBA.
+fn image_rgba(encoded: &str) -> Result<String, String> {
+    use base64::Engine as _;
+    use skia_safe::{AlphaType, ColorType, ImageInfo};
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .map_err(|error| format!("bad base64 image: {error}"))?;
+    let image = crate::g2_canvas::decode_image_data(&bytes).ok_or("image decode failed")?;
+    let (w, h) = (image.width(), image.height());
+    let info = ImageInfo::new((w, h), ColorType::RGBA8888, AlphaType::Unpremul, None);
+    let mut pix = vec![0u8; info.min_row_bytes() * h as usize];
+    let ok = image.read_pixels(&info, &mut pix, info.min_row_bytes(), (0, 0), skia_safe::image::CachingHint::Allow);
+    if !ok {
+        return Err("read_pixels failed".into());
+    }
+    Ok(format!(
+        "{{\"width\":{w},\"height\":{h},\"rgba\":\"{}\"}}",
+        base64::engine::general_purpose::STANDARD.encode(pix)
+    ))
 }
 
 #[derive(Serialize)]
@@ -351,16 +743,26 @@ fn measure_text(
         None => Font::default(),
     };
     font.set_size(font_size);
+    // Match browser canvas measureText: subpixel, un-hinted advances (Chrome/DirectWrite
+    // natural widths). Without this, hinted integer advances measure ~3% narrower.
+    font.set_subpixel(true);
+    font.set_hinting(skia_safe::FontHinting::None);
+    // ponytail: Chrome's fontBoundingBoxAscent uses the DWrite win metrics (14 for
+    // 12px Segoe-ish), not the typo metrics (11) — linear metrics switches skia to
+    // the typo set and G2's axis padding (label heights) drifts ~3px per row.
+    font.set_linear_metrics(false);
 
     let (width, bounds) = font.measure_str(text, None);
     let (_, metrics) = font.metrics();
 
+    // ponytail: Chrome quantizes the four bounding-box metrics to integers (width stays
+    // fractional); rounding keeps G2's layout math pixel-identical to the browser.
     TextMeasure {
         width: width.max(0.0),
-        actual_bounding_box_ascent: (-bounds.top).max(0.0),
-        actual_bounding_box_descent: bounds.bottom.max(0.0),
-        font_bounding_box_ascent: (-metrics.ascent).max(0.0),
-        font_bounding_box_descent: metrics.descent.max(0.0),
+        actual_bounding_box_ascent: (-bounds.top).max(0.0).round(),
+        actual_bounding_box_descent: bounds.bottom.max(0.0).round(),
+        font_bounding_box_ascent: (-metrics.ascent).max(0.0).round(),
+        font_bounding_box_descent: metrics.descent.max(0.0).round(),
     }
 }
 
@@ -373,9 +775,59 @@ fn pick_typeface(font_mgr: &FontMgr, font_families: &str, style: FontStyle) -> O
         if let Some(typeface) = font_mgr.match_family_style(family, style) {
             return Some(typeface);
         }
+        // ponytail: Chrome resolves generic families through its own fallback list
+        // (e.g. sans-serif lands on Noto Sans on machines that have it, else Arial).
+        // Mirror the common candidates so measurements match the browser.
+        if let Some(candidates) = generic_candidates(family) {
+            for candidate in candidates {
+                if let Some(typeface) = font_mgr.match_family_style(candidate, style) {
+                    return Some(typeface);
+                }
+            }
+        }
         if let Some(typeface) = font_mgr.legacy_make_typeface(Some(family), style) {
             return Some(typeface);
         }
     }
     None
+}
+
+pub(crate) fn generic_candidates(family: &str) -> Option<&'static [&'static str]> {
+    match family.to_ascii_lowercase().as_str() {
+        // ponytail: headless Edge resolves sans-serif to the platform UI metric
+        // family (Segoe UI on this machine); this order matched its measureText
+        // to within 0.3px. Do NOT put Arial first — it drifts the other way.
+        "sans-serif" | "sans serif" => {
+            Some(&["Noto Sans SC", "Noto Sans", "Microsoft YaHei", "Arial", "Segoe UI"])
+        }
+        "serif" => Some(&["Times New Roman", "Noto Serif", "Georgia"]),
+        "monospace" | "monospace ct" => Some(&["Consolas", "Courier New", "Noto Sans Mono"]),
+        "system-ui" | "-apple-system" | "cursive" | "fantasy" => {
+            Some(&["Segoe UI", "Arial"])
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod font_tests {
+    use super::*;
+    #[test]
+    fn list_noto_families() {
+        let mgr = FontMgr::default();
+        let names: Vec<String> = mgr.family_names().collect();
+        let mut noto = Vec::new();
+        let mut has_arial = false;
+        for n in &names {
+            let l = n.to_lowercase();
+            if l.contains("noto") { noto.push(n.clone()); }
+            if l.contains("arial") { has_arial = true; }
+        }
+        println!("total={}", names.len());
+        println!("noto={:?} arial={}", noto, has_arial);
+        let m = mgr.match_family_style("Noto Sans", FontStyle::normal());
+        println!("match Noto Sans: {:?}", m.is_some());
+        let m2 = mgr.match_family_style("Arial", FontStyle::normal());
+        println!("match Arial: {:?}", m2.is_some());
+    }
 }

@@ -3,3 +3,12 @@ output*.svg
 output*.png
 js/node_modules
 artifacts/
+
+# external G2 site repo clone + local tooling state
+.g2-repo/
+.codegraph/
+.claude/
+
+# lockfiles stay local
+Cargo.lock
+js/bun.lock

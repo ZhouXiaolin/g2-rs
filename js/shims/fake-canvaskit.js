@@ -9,10 +9,9 @@ function hostLog(level, message, extra) {
 }
 
 const trace = [];
-const commands = [];
 let nextId = 1;
 const MAX_TRACE = 2000;
-const MAX_COMMANDS = 10000;
+const MAX_COMMANDS = 200000;
 
 function cloneTaggedValue(value, depth = 0, seen = new WeakSet()) {
   if (value === null || value === undefined) return value;
@@ -56,7 +55,36 @@ function record(name, args) {
   return entry;
 }
 
+// One layer per CanvasKit surface (i.e. per chart canvas). Multi-chart demos
+// render several stacked canvases; the probe computes their page offsets and
+// the replay composites layers at those offsets.
+const layers = [];
+let activeLayer = null;
+
+function ensureLayer() {
+  if (activeLayer) return activeLayer;
+  const layer = {
+    index: layers.length,
+    x: 0,
+    y: 0,
+    width: 0,
+    height: 0,
+    canvas: null,
+    commands: [],
+  };
+  layers.push(layer);
+  activeLayer = layer;
+  return layer;
+}
+
 function recordCommand(kind, payload = {}) {
+  const layer = ensureLayer();
+  const commands = layer.commands;
+  if (kind === "clear") {
+    // ponytail: endFrame starts with canvas.clear, so treat clear as a frame boundary;
+    // commands then reflect the LAST complete frame, matching what a real canvas shows.
+    commands.length = 0;
+  }
   const entry = {
     index: commands.length,
     kind,
@@ -156,6 +184,66 @@ function parseColorString(value) {
   return parseHexColor(text) || parseRgbColor(text) || NAMED_COLORS[text] || null;
 }
 
+function toBase64(bytes) {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  let out = "";
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i];
+    const b1 = bytes[i + 1];
+    const b2 = bytes[i + 2];
+    out += chars[b0 >> 2];
+    out += chars[((b0 & 3) << 4) | (b1 === undefined ? 0 : b1 >> 4)];
+    out += b1 === undefined ? "=" : chars[((b1 & 15) << 2) | (b2 === undefined ? 0 : b2 >> 6)];
+    out += b2 === undefined ? "=" : chars[b2 & 63];
+  }
+  return out;
+}
+
+function flattenColorArray(colors) {
+  const flat = Array.from(colors || []);
+  // g-canvaskit's radial path passes per-stop arrays ([Float32Array(4), ...]);
+  // the linear path passes a flat [r,g,b,a,...]. Normalize both.
+  const nested =
+    flat.length > 0 &&
+    flat.every((item) => item && typeof item === "object" && typeof item.length === "number");
+  const out = [];
+  if (nested) {
+    for (const stop of flat) {
+      const c = Array.from(stop).map((v) => finiteNumber(v));
+      out.push(normalizeColor(c) || [0, 0, 0, 1]);
+    }
+    return out;
+  }
+  for (let i = 0; i + 3 < flat.length; i += 4) {
+    out.push(normalizeColor(flat.slice(i, i + 4)) || [0, 0, 0, 1]);
+  }
+  return out;
+}
+
+function snapshotShader(shader) {
+  if (!shader || typeof shader !== "object") return null;
+  const state = shader.state || {};
+  if (state.kind === "image") {
+    return {
+      kind: "image",
+      rgba: state.rgba || null,
+      width: finiteNumber(state.width),
+      height: finiteNumber(state.height),
+      matrix: Array.isArray(state.matrix) ? state.matrix.map((v) => finiteNumber(v)) : [1, 0, 0, 0, 1, 0, 0, 0, 1],
+    };
+  }
+  if (state.kind !== "linear" && state.kind !== "radial") return null;
+  const out = { kind: state.kind, colors: state.colors || [], positions: state.positions || [] };
+  if (state.kind === "linear") {
+    out.start = state.start || [0, 0];
+    out.end = state.end || [0, 0];
+  } else {
+    out.center = state.center || [0, 0];
+    out.radius = finiteNumber(state.radius);
+  }
+  return out;
+}
+
 function snapshotPaint(paint) {
   if (!paint || typeof paint !== "object") return null;
   const state = paint.state || {};
@@ -169,11 +257,20 @@ function snapshotPaint(paint) {
     strokeJoin: typeof state.strokeJoin === "string" ? state.strokeJoin : null,
     strokeMiter: finiteOptionalNumber(state.strokeMiter),
     alpha: finiteOptionalNumber(state.alpha),
+    shader: snapshotShader(state.shader),
     hasShader: state.shader !== undefined,
     hasPathEffect: state.pathEffect !== undefined,
     hasMaskFilter: state.maskFilter !== undefined,
+    maskFilter: snapshotMaskFilter(state.maskFilter),
     pathEffect: snapshotPathEffect(state.pathEffect),
   };
+}
+
+function snapshotMaskFilter(maskFilter) {
+  if (!maskFilter || typeof maskFilter !== "object") return null;
+  const state = maskFilter.state || {};
+  if (state.kind !== "blur") return null;
+  return { kind: "blur", sigma: finiteNumber(state.sigma) };
 }
 
 function snapshotPathEffect(pathEffect) {
@@ -411,8 +508,10 @@ function measureParagraph(text, textStyle, paragraphStyle, width) {
     context.font = buildTextMeasureFont(textStyle);
     const metrics = context.measureText(measuredText);
     measuredWidth = finiteNumber(metrics?.width, measuredWidth);
-    ascent = finiteNumber(metrics?.actualBoundingBoxAscent, ascent);
-    descent = finiteNumber(metrics?.actualBoundingBoxDescent, descent);
+    // Real canvaskit Paragraph.getHeight() derives from font metrics, not glyph ink
+    // bounds — using actualBoundingBox made labels sit several px off vs the browser.
+    ascent = finiteNumber(metrics?.fontBoundingBoxAscent, ascent);
+    descent = finiteNumber(metrics?.fontBoundingBoxDescent, descent);
   }
 
   const layoutWidth = finiteOptionalNumber(width);
@@ -478,6 +577,147 @@ function defineFake(target, type) {
   });
   return target;
 }
+
+function makeImageShaderFromState(state, matrix) {
+  // ponytail: the g-canvas baseline caches one CanvasPattern per element, so the
+  // tile phase comes from the FIRST shape's bounds min and is shared by the rest.
+  // Mirror that with a first-seen phase cache keyed by the pattern element.
+  const m = Array.from(matrix || [1, 0, 0, 0, 1, 0, 0, 0, 1]).map((v) => finiteNumber(v));
+  const key = state.pattern_key || "pattern";
+  const cache = (globalThis.__patternPhaseCache = globalThis.__patternPhaseCache || {});
+  if (!cache[key]) cache[key] = [m[2], m[5]];
+  m[2] = cache[key][0];
+  m[5] = cache[key][1];
+  return makeNoopObject("Shader", {
+    state: {
+      kind: "image",
+      rgba: state.rgba || null,
+      encoded: state.encoded || null,
+      width: finiteNumber(state.width),
+      height: finiteNumber(state.height),
+      matrix: m,
+    },
+  });
+}
+
+function makeTextureImage(state) {
+  return makeNoopObject("Image", {
+    state,
+    makeShaderOptions(tx, ty, fx, fy, matrix) {
+      return makeImageShaderFromState(state, matrix);
+    },
+    makeShaderCubic(tx, ty, B, C, matrix) {
+      return makeImageShaderFromState(state, matrix);
+    },
+  });
+}
+
+// g-canvaskit skips rect-shaped G-element patterns (empty branch); rasterize them
+// here so pattern fills render like the g-canvas baseline.
+globalThis.__renderRectPattern = function (el) {
+  try {
+    const style = el.style || {};
+    const fill = styleColorValue(style.fill);
+    const children = el.childNodes || [];
+    hostLog("debug", "[pattern.rect] nodeName=" + el.nodeName + " children=" + children.length + " w=" + JSON.stringify(el.style && el.style.width) + " childNames=" + JSON.stringify((children || []).map((c) => c && c.nodeName)));
+    let lines = [];
+    let lineWidth = 1;
+    let stroke = null;
+    let strokeOpacity = 1;
+    for (const child of children) {
+      if (!child || child.nodeName !== "path") continue;
+      lines = lines.concat(pathPolylineSegments(child));
+      lineWidth = styleNumberValue(child.style && child.style.lineWidth, lineWidth);
+      stroke = styleColorValue(child.style && child.style.stroke) || stroke;
+      strokeOpacity = styleNumberValue(child.style && child.style.strokeOpacity, strokeOpacity);
+    }
+    hostLog("debug", "[pattern.lines] n=" + lines.length + " " + JSON.stringify(lines.slice(0, 3)));
+    return {
+      __patternCanvas: true,
+      pattern_key: String(el.entity || el.id || "pattern"),
+      width: styleNumberValue(style.width, 0),
+      height: styleNumberValue(style.height, 0),
+      fill,
+      lines,
+      line_width: lineWidth,
+      stroke,
+      stroke_opacity: strokeOpacity,
+    };
+  } catch (error) {
+    hostLog("warn", "[pattern.render-failed] " + error);
+    return null;
+  }
+}
+
+function styleNumberValue(value, fallback) {
+  if (typeof value === "number") return value;
+  if (value && typeof value.value === "number") return value.value;
+  const n = Number(value);
+  return Number.isFinite(n) && String(value || "").trim() !== "" ? n : fallback;
+}
+
+function styleColorValue(value) {
+  if (Array.isArray(value)) return normalizeColor(value);
+  if (typeof value === "string") return parseColorString(value);
+  if (value && typeof value.value === "string") return parseColorString(value.value);
+  return null;
+}
+
+function pathPolylineSegments(el) {
+  const d = (el.style && el.style.d) || "";
+  if (typeof d !== "string") return [];
+  // Minimal SVG path parser: M/L/H/V/Z polylines (the g-API pattern shapes).
+  const tokens = d.match(/[MLHVZmlhvz]|-?\d*\.?\d+(?:e[-+]?\d+)?/g) || [];
+  const out = [];
+  let current = null;
+  let i = 0;
+  const num = () => Number(tokens[i++]);
+  while (i < tokens.length) {
+    const command = tokens[i++];
+    if (command === undefined) break;
+    const upper = command.toUpperCase();
+    const relative = command !== upper;
+    if (upper === "Z") {
+      current = null;
+      continue;
+    }
+    let more = true;
+    while (more) {
+      let x;
+      let y;
+      if (upper === "H") {
+        x = num();
+        y = current ? current[1] : 0;
+      } else if (upper === "V") {
+        x = current ? current[0] : 0;
+        y = num();
+      } else {
+        x = num();
+        y = num();
+      }
+      if (!Number.isFinite(x) || !Number.isFinite(y)) {
+        more = false;
+        i -= 1;
+        break;
+      }
+      const ax = relative && current ? current[0] + x : x;
+      const ay = relative && current ? current[1] + y : y;
+      if (upper === "M") {
+        current = [ax, ay];
+        // subsequent coordinate pairs continue as implicit lineto
+      } else if (current) {
+        out.push([current[0], current[1], ax, ay]);
+        current = [ax, ay];
+      } else {
+        current = [ax, ay];
+      }
+      // implicit repeats only for M->L chains handled by loop; stop for M/L pairs
+      more = false;
+    }
+  }
+  return out;
+}
+
 
 function makeNoopObject(type, extra = {}) {
   const target = defineFake(
@@ -856,7 +1096,13 @@ function createFakeCanvas() {
       },
       drawImageRectOptions(image, srcRect, dstRect, filter, mipmap, paint) {
         record("Canvas.drawImageRectOptions", [image, srcRect, dstRect, filter, mipmap, paint]);
+        const state = (image && image.state) || {};
         recordCommand("drawImageRectOptions", {
+          image: state.encoded
+            ? { encoded: state.encoded }
+            : state.rgba && state.width && state.height
+              ? { rgba: state.rgba, width: state.width, height: state.height }
+              : null,
           srcRect: Array.isArray(srcRect) ? srcRect.map((value) => finiteNumber(value, 0)) : [],
           dstRect: Array.isArray(dstRect) ? dstRect.map((value) => finiteNumber(value, 0)) : [],
           paint: snapshotPaint(paint),
@@ -897,17 +1143,74 @@ function createFakeCanvas() {
 }
 
 function createFakeSurface(htmlCanvas) {
+  const layer = {
+    index: layers.length,
+    x: 0,
+    y: 0,
+    width: finiteNumber(htmlCanvas && htmlCanvas.__cssWidth) || 0,
+    height: finiteNumber(htmlCanvas && htmlCanvas.__cssHeight) || 0,
+    canvas: htmlCanvas || null,
+    commands: [],
+  };
+  layers.push(layer);
   const canvas = createFakeCanvas();
+  // Route every canvas op to this layer; frames of different surfaces interleave
+  // in creation order, so binding at call time keeps each frame in its layer.
+  const boundCanvas = new Proxy(canvas, {
+    get(target, prop) {
+      const value = target[prop];
+      if (typeof value === "function") {
+        return function (...args) {
+          activeLayer = layer;
+          return value.apply(target, args);
+        };
+      }
+      return value;
+    },
+  });
   let frameCount = 0;
   return defineFake(
     {
       getCanvas() {
         record("Surface.getCanvas", arguments);
-        return canvas;
+        return boundCanvas;
       },
       makeImageFromTextureSource(source) {
         record("Surface.makeImageFromTextureSource", [source]);
+        if (source && source.__base64) {
+          return makeTextureImage({
+            encoded: source.__base64,
+            width: source.naturalWidth,
+            height: source.naturalHeight,
+          });
+        }
+        if (source && source.__patternCanvas && typeof globalThis.__rust_rasterize_pattern === "function") {
+          const w = Math.max(1, Math.round(styleNumberValue(source.width, 1)));
+          const h = Math.max(1, Math.round(styleNumberValue(source.height, 1)));
+          const rgba = globalThis.__rust_rasterize_pattern(
+            JSON.stringify({
+              width: w,
+              height: h,
+              fill: source.fill,
+              lines: source.lines,
+              line_width: source.line_width,
+              stroke: source.stroke,
+              stroke_opacity: source.stroke_opacity,
+            }),
+          );
+          if (rgba) return makeTextureImage({ rgba, width: w, height: h });
+        }
+        if (source && source._pixels && source._width && typeof globalThis.__rust_encode_png === "function") {
+          return makeTextureImage({
+            rgba: base64Encode(source.ensurePixels()),
+            width: source._width,
+            height: source._height,
+          });
+        }
         return makeNoopObject("Image");
+      },
+      MakeImageFromTextureSource(source) {
+        return surface.makeImageFromTextureSource(source);
       },
       makeImageSnapshot() {
         record("Surface.makeImageSnapshot", arguments);
@@ -930,6 +1233,7 @@ function createFakeSurface(htmlCanvas) {
       },
       flush() {
         record("Surface.flush", arguments);
+        activeLayer = layer;
         recordCommand("flush");
       },
       deleteLater() {
@@ -1013,21 +1317,57 @@ function createFakeCanvasKit() {
     MaskFilter: {
       MakeBlur(style, sigma, respectCTM) {
         record("MaskFilter.MakeBlur", [style, sigma, respectCTM]);
-        return makeNoopObject("MaskFilter");
+        return makeNoopObject("MaskFilter", { state: { kind: "blur", sigma: finiteNumber(sigma) } });
       },
     },
     Shader: {
+      MakeImageFromEncoded(data) {
+        record("CanvasKit.MakeImageFromEncoded", [data]);
+        return makeNoopObject("Image", {
+          state: { encoded: toBase64(new Uint8Array(data || [])) },
+        });
+      },
+      MakeImage(info, pixels) {
+        record("CanvasKit.MakeImage", [info, pixels]);
+        return makeNoopObject("Image", {
+          state: {
+            rgba: toBase64(new Uint8Array(pixels || [])),
+            width: finiteNumber(info && info.width),
+            height: finiteNumber(info && info.height),
+          },
+        });
+      },
+      MakeImageFromCanvasImageSource(source) {
+        record("CanvasKit.MakeImageFromCanvasImageSource", [source]);
+        return makeNoopObject("Image");
+      },
       MakeLinearGradient(start, end, colors, pos, tileMode) {
         record("Shader.MakeLinearGradient", [start, end, colors, pos, tileMode]);
-        return makeNoopObject("Shader");
+        return makeNoopObject("Shader", {
+          state: {
+            kind: "linear",
+            start: [finiteNumber(start && start[0]), finiteNumber(start && start[1])],
+            end: [finiteNumber(end && end[0]), finiteNumber(end && end[1])],
+            colors: flattenColorArray(colors),
+            positions: Array.from(pos || []).map((v) => finiteNumber(v)),
+          },
+        });
       },
       MakeRadialGradient(center, radius, colors, pos, tileMode) {
         record("Shader.MakeRadialGradient", [center, radius, colors, pos, tileMode]);
-        return makeNoopObject("Shader");
+        return makeNoopObject("Shader", {
+          state: {
+            kind: "radial",
+            center: [finiteNumber(center && center[0]), finiteNumber(center && center[1])],
+            radius: finiteNumber(radius),
+            colors: flattenColorArray(colors),
+            positions: Array.from(pos || []).map((v) => finiteNumber(v)),
+          },
+        });
       },
       MakeBlend(mode, a, b) {
         record("Shader.MakeBlend", [mode, a, b]);
-        return makeNoopObject("Shader");
+        return makeNoopObject("Shader", { state: { kind: "blend" } });
       },
     },
     Color4f(r, g, b, a = 1) {
@@ -1154,8 +1494,9 @@ function createFakeCanvasKit() {
 export function createFakeCanvasKitInit() {
   return function fakeCanvasKitInit(options = {}) {
     trace.length = 0;
-    commands.length = 0;
     nextId = 1;
+    // Each init owns one layer; commands accumulate per layer across inits.
+    activeLayer = null;
     globalThis.__fakeCanvasKitCurrentObject = null;
     globalThis.__fakeCanvasKitCurrentPaints = null;
     globalThis.__fakeCanvasKitTextLayoutContext = null;
@@ -1165,8 +1506,22 @@ export function createFakeCanvasKitInit() {
     globalThis.__getFakeCanvasKitTrace = function () {
       return trace.slice();
     };
+    globalThis.__getFakeCanvasKitLayers = function () {
+      return layers.map((layer) => ({
+        index: layer.index,
+        x: layer.x,
+        y: layer.y,
+        width: layer.width,
+        height: layer.height,
+        // live element reference for layout computation; stripped at collect time
+        canvas: layer.canvas,
+        commands: layer.commands.slice(),
+      }));
+    };
     globalThis.__getFakeCanvasKitCommands = function () {
-      return commands.slice();
+      const all = [];
+      for (const layer of layers) all.push(...layer.commands);
+      return all;
     };
     return Promise.resolve(kit);
   };

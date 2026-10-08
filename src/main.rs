@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use katextest::{render_scene_to_png, scene_from_json, G2Probe, G2RunOptions, ProbeLog};
+use g2_rs::{render_scene_to_png, scene_from_json, G2Probe, G2RunOptions, ProbeLog};
 
 struct Cli {
     input: Option<String>,
@@ -96,8 +96,9 @@ fn run_cli() {
     println!("PNG: {}", png_path.display());
     println!("Logs: {}", logs_path.display());
     if let Some(error) = report.error.as_deref() {
-        println!("Error: {error}");
-        std::process::exit(1);
+        // Degrade like the browser harness: a failed user script still yields a
+        // frame (blank/partial) for pixel comparison; the diff reports the gap.
+        println!("Error (non-fatal): {error}");
     }
 }
 

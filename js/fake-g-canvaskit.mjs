@@ -1,6 +1,7 @@
 import {
   AbstractRenderer,
   AbstractRendererPlugin,
+  DisplayObject,
   DomInteraction,
   HTMLRenderer,
   ImageLoader,
@@ -28,6 +29,32 @@ function hostLog(level, message, extra) {
 function patchCanvasRun() {
   if (canvasRunPatched) return;
   canvasRunPatched = true;
+
+  // TEMP DEBUG: trace fill attribute conversions on DisplayObject
+  if (DisplayObject && DisplayObject.prototype) {
+    const proto = DisplayObject.prototype;
+    const origSetAttribute = proto.setAttribute;
+    if (typeof origSetAttribute === "function") {
+      // g's lazy style parser mangles legacy gradient strings ('r(cx,cy,r) stops',
+      // 'l(angle) stops') into transparent black; g-lite's parseColor handles them
+      // correctly, so pre-parse to the gradient array before g stores the attribute.
+      proto.setAttribute = function fixedSetAttribute(name, value) {
+        if (
+          (name === "fill" || name === "stroke") &&
+          typeof value === "string" &&
+          /^[rl]\s*\(/.test(value)
+        ) {
+          try {
+            const parsed = parseColor(value);
+            if (Array.isArray(parsed)) { hostLog("debug", "[gradient-fix] pre-parsed "+value.slice(0,20)+" -> array"+parsed.length); return origSetAttribute.call(this, name, parsed); }
+          } catch {
+            /* fall through with the raw string */
+          }
+        }
+        return origSetAttribute.call(this, name, value);
+      };
+    }
+  }
 
   const canvasProto = GCanvas?.prototype;
   if (!canvasProto || typeof canvasProto.run !== "function") {
@@ -252,6 +279,9 @@ class FakeCanvasKitContextService {
 
   resize(width, height) {
     if (!this.$canvas) return;
+    // Probe layout hint: CSS pixel size for layer offset computation.
+    this.$canvas.__cssWidth = width;
+    this.$canvas.__cssHeight = height;
     this.$canvas.width = this.dpr * width;
     this.$canvas.height = this.dpr * height;
     setDOMSize(this.$canvas, width, height);
@@ -294,13 +324,46 @@ let endFrameGeneration = 0;
 class PatchedCanvasKitPlugin extends CanvaskitRenderer.Plugin {
   init() {
     super.init();
-    const internal = this.plugins[0];
+    // super.init() appends a fresh internal plugin per canvas (shared renderer
+    // across canvases re-runs init); the LAST one belongs to the current canvas.
+    const internal = this.plugins[this.plugins.length - 1];
+    hostLog("info", "[patched-plugin] init internals=" + this.plugins.length);
     patchRendererContributions(internal);
     const originalRenderDisplayObject = internal.renderDisplayObject;
 
-    internal.renderDisplayObject = function patchedRenderDisplayObject(object, canvas) {
+    function patchedRenderDisplayObjectDebug(object) {
+    if (object?.nodeName === "rect" && object?.parsedStyle && "fill" in object.parsedStyle) {
+      const fill = object.parsedStyle.fill;
+      if (Array.isArray(fill) && !globalThis.__fillSpy2) {
+        globalThis.__fillSpy2 = true;
+        try {
+          let ps = object.parsedStyle;
+          Object.defineProperty(object, "parsedStyle", {
+            get() { return ps; },
+            set(v) {
+              const nf = v && v.fill;
+              globalThis.__rust_log?.("debug", "[fill-spy2] parsedStyle REPLACED, fill -> " + (nf ? (Array.isArray(nf) ? "ARRAY" : nf.constructor ? nf.constructor.name : typeof nf) : "null") + " stack=" + String(new Error().stack || "").split(String.fromCharCode(10)).slice(1, 5).join(" | "));
+              ps = v;
+            },
+            configurable: true,
+          });
+        } catch (e) {
+          globalThis.__rust_log?.("debug", "[fill-spy2] install failed " + e.message);
+        }
+      }
+      const desc = Array.isArray(fill)
+        ? "ARRAY[" + fill.length + "] type=" + (fill[0] && fill[0].type)
+        : typeof fill === "object" && fill
+          ? fill.constructor.name + " r=" + fill.r + " a=" + fill.alpha
+          : String(fill).slice(0, 30);
+      hostLog("debug", "[fill-debug2] " + desc);
+    }
+  }
+
+  internal.renderDisplayObject = function patchedRenderDisplayObject(object, canvas) {
       normalizeRectRadius(object);
       normalizePaintOpacity(object);
+      patchedRenderDisplayObjectDebug(object);
       const popSource = pushRenderSource(object);
       const previousTextLayout = globalThis.__fakeCanvasKitTextLayoutContext;
       if (object?.nodeName === "text") {
@@ -335,8 +398,14 @@ class PatchedCanvasKitPlugin extends CanvaskitRenderer.Plugin {
     };
 
     internal.apply = function patchedApply(context) {
+      hostLog("info", "[patched-plugin] apply container=" + JSON.stringify(context?.config?.container?.id ?? null) + " canvasId=" + JSON.stringify(context?.config?.canvas?.id ?? null));
       this.context = context;
       const { renderingService, renderingContext } = context;
+      const originalRsRender = renderingService.render;
+      renderingService.render = function patchedRsRender(canvas, frame, rerenderCallback) {
+        hostLog("info", "[rs.render] reasons=" + renderingContext.renderReasons.size + " inited=" + renderingService.inited);
+        return originalRsRender.call(this, canvas, frame, rerenderCallback);
+      };
 
       renderingService.hooks.init.tap("fake-canvaskit-renderer", () => {
         const { surface } = this.context.contextService.getContext();
@@ -345,6 +414,7 @@ class PatchedCanvasKitPlugin extends CanvaskitRenderer.Plugin {
       });
 
       renderingService.hooks.endFrame.tap("fake-canvaskit-renderer", () => {
+        hostLog("info", "[patched-plugin] endFrame fired");
         const { surface, CanvasKit } = this.context.contextService.getContext();
         const canvas = surface.getCanvas();
         const clearColor = parseColor(this.context.config.background);
@@ -417,6 +487,9 @@ export class Renderer extends AbstractRenderer {
     this.registerPlugin(canvaskitRendererPlugin);
     this.registerPlugin(new DomInteraction.Plugin());
     this.registerPlugin(new CanvasPicker.Plugin());
-    this.registerPlugin(new HTMLRenderer.Plugin());
+    // HTMLRenderer renders display objects as real DOM nodes overlaying the
+    // canvas; our fake DOM can't lay those out and hard-crashes on them
+    // (labelRender HTML). Skip it — those nodes simply don't draw.
+    // this.registerPlugin(new HTMLRenderer.Plugin());
   }
 }

@@ -1,10 +1,26 @@
 use serde::Deserialize;
 use serde_json::Value;
 use skia_safe::{
-    paint, path_builder, surfaces, Color, EncodedImageFormat, FontMgr, Matrix, Paint,
-    PathBuilder, PathDirection, PathEffect, Point, RRect, Rect,
+    paint, path_builder, surfaces, Color, EncodedImageFormat, FilterMode, FontMgr, Matrix,
+    MipmapMode, Paint, PathBuilder, PathDirection, PathEffect, Point, RRect, Rect, SamplingOptions,
+    Shader, TileMode,
 };
+use skia_safe::canvas::SrcRectConstraint;
 use skia_safe::textlayout::{FontCollection, ParagraphBuilder, ParagraphStyle, TextAlign, TextDirection, TextStyle};
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SceneLayerPayload {
+    #[serde(default)]
+    pub x: f32,
+    #[serde(default)]
+    pub y: f32,
+    #[serde(default)]
+    pub width: Option<f32>,
+    #[serde(default)]
+    pub height: Option<f32>,
+    #[serde(default)]
+    pub commands: Vec<G2CanvasCommand>,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct G2ScenePayload {
@@ -13,13 +29,24 @@ pub struct G2ScenePayload {
     #[serde(default)]
     #[serde(rename = "fakeCanvasKitCommands")]
     pub fake_canvas_kit_commands: Vec<G2CanvasCommand>,
+    #[serde(default)]
+    pub layers: Vec<SceneLayerPayload>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SceneLayer {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub commands: Vec<G2CanvasCommand>,
 }
 
 #[derive(Debug, Clone)]
 pub struct G2Scene {
     pub width: i32,
     pub height: i32,
-    pub commands: Vec<G2CanvasCommand>,
+    pub layers: Vec<SceneLayer>,
 }
 
 #[derive(Debug)]
@@ -40,6 +67,50 @@ impl std::fmt::Display for G2ReplayError {
 impl std::error::Error for G2ReplayError {}
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct ImagePayload {
+    #[serde(default)]
+    pub encoded: Option<String>,
+    #[serde(default)]
+    pub rgba: Option<String>,
+    #[serde(default)]
+    pub width: Option<f32>,
+    #[serde(default)]
+    pub height: Option<f32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ShaderSnapshot {
+    pub kind: String,
+    #[serde(default)]
+    pub colors: Vec<Vec<f32>>,
+    #[serde(default)]
+    pub positions: Vec<f32>,
+    #[serde(default)]
+    pub start: Vec<f32>,
+    #[serde(default)]
+    pub end: Vec<f32>,
+    #[serde(default)]
+    pub center: Vec<f32>,
+    #[serde(default)]
+    pub radius: Option<f32>,
+    #[serde(default)]
+    pub rgba: Option<String>,
+    #[serde(default)]
+    pub width: Option<f32>,
+    #[serde(default)]
+    pub height: Option<f32>,
+    #[serde(default)]
+    pub matrix: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MaskFilterSnapshot {
+    pub kind: String,
+    #[serde(default)]
+    pub sigma: f32,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct PaintSnapshot {
     #[serde(default)]
     pub style: Option<String>,
@@ -60,6 +131,8 @@ pub struct PaintSnapshot {
     #[serde(default)]
     pub alpha: Option<f32>,
     #[serde(default)]
+    pub shader: Option<ShaderSnapshot>,
+    #[serde(default)]
     #[serde(rename = "hasShader")]
     pub has_shader: bool,
     #[serde(default)]
@@ -68,6 +141,8 @@ pub struct PaintSnapshot {
     #[serde(default)]
     #[serde(rename = "hasMaskFilter")]
     pub has_mask_filter: bool,
+    #[serde(default)]
+    pub mask_filter: Option<MaskFilterSnapshot>,
     #[serde(default)]
     #[serde(rename = "pathEffect")]
     pub path_effect: Option<PathEffectSnapshot>,
@@ -128,32 +203,9 @@ pub struct DisplayObjectSnapshot {
     #[serde(rename = "strokeOpacity")]
     pub stroke_opacity: Option<f32>,
     #[serde(default)]
-    pub stroke: Option<SourceColorSnapshot>,
+    pub stroke: Option<Value>,
     #[serde(default)]
-    pub fill: Option<SourceColorSnapshot>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-pub enum SourceColorSnapshot {
-    Object(SourceColorObject),
-    Array([f32; 4]),
-    Text(String),
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct SourceColorObject {
-    #[serde(default)]
-    pub r: Option<f32>,
-    #[serde(default)]
-    pub g: Option<f32>,
-    #[serde(default)]
-    pub b: Option<f32>,
-    #[serde(default)]
-    pub alpha: Option<f32>,
-    #[serde(default)]
-    #[serde(rename = "isNone")]
-    pub is_none: Option<bool>,
+    pub fill: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -279,6 +331,8 @@ pub enum G2CanvasCommand {
     #[serde(rename = "drawImageRectOptions")]
     DrawImageRectOptions {
         #[serde(default)]
+        image: Option<ImagePayload>,
+        #[serde(default)]
         #[serde(rename = "srcRect")]
         src_rect: Vec<f32>,
         #[serde(default)]
@@ -293,16 +347,44 @@ pub enum G2CanvasCommand {
 pub fn scene_from_json(json: &str) -> Result<G2Scene, G2ReplayError> {
     let payload: G2ScenePayload =
         serde_json::from_str(json).map_err(|e| G2ReplayError::Json(e.to_string()))?;
+    let layers = if payload.layers.is_empty() {
+        vec![SceneLayer {
+            x: 0.0,
+            y: 0.0,
+            width: payload.width as f32,
+            height: payload.height as f32,
+            commands: payload.fake_canvas_kit_commands,
+        }]
+    } else {
+        payload
+            .layers
+            .into_iter()
+            .map(|layer| SceneLayer {
+                x: layer.x,
+                y: layer.y,
+                width: layer.width.unwrap_or(0.0),
+                height: layer.height.unwrap_or(0.0),
+                commands: layer.commands,
+            })
+            .collect()
+    };
     Ok(G2Scene {
         width: payload.width as i32,
         height: payload.height as i32,
-        commands: payload.fake_canvas_kit_commands,
+        layers,
     })
 }
 
 pub fn render_scene_to_png(scene: &G2Scene) -> Result<Vec<u8>, G2ReplayError> {
     let image = render_scene_to_image(scene)?;
-    encode_png(&image)
+    // ponytail: G2 clears its canvas transparent; browser shows it on a white page.
+    // Composite over white so outputs/diffs match what a viewer sees. If transparent
+    // output is ever needed, encode `image` directly here instead.
+    let mut surface = surfaces::raster_n32_premul((scene.width, scene.height))
+        .ok_or_else(|| G2ReplayError::Render("failed to create composite surface".into()))?;
+    surface.canvas().clear(Color::WHITE);
+    surface.canvas().draw_image(image, (0, 0), None);
+    encode_png(&surface.image_snapshot())
 }
 
 fn render_scene_to_image(scene: &G2Scene) -> Result<skia_safe::Image, G2ReplayError> {
@@ -312,8 +394,22 @@ fn render_scene_to_image(scene: &G2Scene) -> Result<skia_safe::Image, G2ReplayEr
 
     {
         let canvas = surface.canvas();
-        for command in &scene.commands {
-            replay_command(canvas, &mut text, command)?;
+        for layer in &scene.layers {
+            canvas.save();
+            canvas.translate((layer.x, layer.y));
+            // Each layer replays inside its surface bounds, like a real canvas
+            // element: otherwise a later layer's clear would erase earlier ones.
+            if layer.width > 0.0 && layer.height > 0.0 {
+                canvas.clip_rect(
+                    skia_safe::Rect::from_xywh(0.0, 0.0, layer.width, layer.height),
+                    None,
+                    None,
+                );
+            }
+            for command in &layer.commands {
+                replay_command(canvas, &mut text, command)?;
+            }
+            canvas.restore();
         }
     }
 
@@ -387,8 +483,7 @@ fn replay_command(
         }
         G2CanvasCommand::DrawPath { meta, path, paint } => {
             if let Some(path) = build_path(path) {
-                if let Some(paint) = resolve_paint(paint.as_ref(), Some(meta), PaintPreference::Auto)?
-                {
+            if let Some(paint) = resolve_paint(paint.as_ref(), Some(meta), PaintPreference::Auto)? {
                     canvas.draw_path(&path, &paint);
                 }
             }
@@ -447,7 +542,29 @@ fn replay_command(
             )?;
         }
         G2CanvasCommand::DrawTextBlob { .. } => {}
-        G2CanvasCommand::DrawImageRectOptions { .. } => {}
+        G2CanvasCommand::DrawImageRectOptions {
+            image,
+            src_rect,
+            dst_rect,
+            paint,
+        } => {
+            let Some(dst) = to_rect(dst_rect) else {
+                return Ok(());
+            };
+            let Some(image) = image.as_ref().and_then(decode_image) else {
+                return Ok(());
+            };
+            let mut paint = resolve_paint(paint.as_ref(), None, PaintPreference::Auto)?.unwrap_or_default();
+            paint.set_anti_alias(true);
+            let src = to_rect(src_rect).map(|r| (r, SrcRectConstraint::Fast));
+            canvas.draw_image_rect_with_sampling_options(
+                &image,
+                src.as_ref().map(|(r, c)| (r, *c)),
+                dst,
+                SamplingOptions::new(FilterMode::Linear, MipmapMode::Linear),
+                &paint,
+            );
+        }
         G2CanvasCommand::Flush => {}
     }
 
@@ -455,9 +572,6 @@ fn replay_command(
 }
 
 fn build_paint(snapshot: &PaintSnapshot) -> Result<Option<Paint>, G2ReplayError> {
-    if snapshot.has_shader || snapshot.has_mask_filter {
-        return Ok(None);
-    }
 
     let style = snapshot.style.as_deref().unwrap_or("fill");
     let stroke_width = snapshot.stroke_width.unwrap_or(1.0).max(0.0);
@@ -465,11 +579,12 @@ fn build_paint(snapshot: &PaintSnapshot) -> Result<Option<Paint>, G2ReplayError>
         return Ok(None);
     }
 
-    let mut color = match snapshot.color {
-        Some(color) => color,
-        None => return Ok(None),
-    };
+    let shader = build_shader(snapshot.shader.as_ref());
+    if snapshot.has_shader && shader.is_none() {
+        return Ok(None); // unsupported shader (e.g. blend) → source-style fallback
+    }
 
+    let mut color = snapshot.color.unwrap_or([1.0, 1.0, 1.0, 1.0]);
     if let Some(alpha) = snapshot.alpha {
         if alpha.is_finite() {
             color[3] *= alpha.clamp(0.0, 1.0);
@@ -499,11 +614,163 @@ fn build_paint(snapshot: &PaintSnapshot) -> Result<Option<Paint>, G2ReplayError>
         "bevel" => paint::Join::Bevel,
         _ => paint::Join::Miter,
     });
+    if let Some(shader) = shader {
+        paint.set_shader(shader);
+    }
+    if let Some(mask_filter) = &snapshot.mask_filter {
+        if mask_filter.kind == "blur" && mask_filter.sigma > 0.0 {
+            paint.set_mask_filter(skia_safe::MaskFilter::blur(
+                skia_safe::BlurStyle::Normal,
+                mask_filter.sigma,
+                None,
+            ));
+        }
+    } else if snapshot.has_mask_filter {
+        return Ok(None); // unsupported maskFilter → source-style fallback
+    }
     if let Some(path_effect) = build_path_effect(snapshot)? {
         paint.set_path_effect(path_effect);
     }
 
     Ok(Some(paint))
+}
+
+fn decode_image(payload: &ImagePayload) -> Option<skia_safe::Image> {
+    use base64::Engine as _;
+    if let Some(encoded) = &payload.encoded {
+        let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+        return decode_image_data(&bytes);
+    }
+    if let (Some(rgba), Some(w), Some(h)) = (&payload.rgba, payload.width, payload.height) {
+        let bytes = base64::engine::general_purpose::STANDARD.decode(rgba).ok()?;
+        let (w, h) = (w.max(1.0) as i32, h.max(1.0) as i32);
+        let info = skia_safe::ImageInfo::new(
+            (w, h),
+            skia_safe::ColorType::RGBA8888,
+            skia_safe::AlphaType::Unpremul,
+            None,
+        );
+        let row_bytes = info.min_row_bytes();
+        if bytes.len() < row_bytes * h as usize {
+            return None;
+        }
+        return skia_safe::images::raster_from_data(
+            &info,
+            skia_safe::Data::new_copy(&bytes),
+            row_bytes,
+        );
+    }
+    None
+}
+
+/// decode encoded (PNG/JPEG/etc) bytes into a skia image; shared with the host runtime.
+pub fn decode_image_data(bytes: &[u8]) -> Option<skia_safe::Image> {
+    skia_safe::Image::from_encoded(skia_safe::Data::new_copy(bytes))
+}
+
+fn build_shader(shader: Option<&ShaderSnapshot>) -> Option<Shader> {
+    let s = shader?;
+    if s.kind == "image" {
+        // Tiled pattern fill (g-element rect patterns): decode rgba and repeat it
+        // through the snapshot's translation matrix.
+        use base64::Engine as _;
+        let rgba = s.rgba.as_ref()?;
+        let width = s.width?.max(1.0) as i32;
+        let height = s.height?.max(1.0) as i32;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(rgba.trim())
+            .ok()?;
+        // rgba payloads are raw pixels, not an encoded file
+        let info = skia_safe::ImageInfo::new(
+            (width, height),
+            skia_safe::ColorType::RGBA8888,
+            skia_safe::AlphaType::Unpremul,
+            None,
+        );
+        let image = skia_safe::images::raster_from_data(
+            &info,
+            skia_safe::Data::new_copy(&bytes),
+            info.min_row_bytes(),
+        )?;
+        let mut matrix = Matrix::new_identity();
+        if s.matrix.len() >= 6 {
+            let m = &s.matrix;
+            matrix = Matrix::new_all(
+                m[0],
+                m[1],
+                m[2],
+                m[3],
+                m[4],
+                m[5],
+                *m.get(6).unwrap_or(&0.0),
+                *m.get(7).unwrap_or(&0.0),
+                *m.get(8).unwrap_or(&1.0),
+            );
+        }
+        return image.to_shader(
+            (TileMode::Repeat, TileMode::Repeat),
+            SamplingOptions::new(FilterMode::Linear, MipmapMode::None),
+            &matrix,
+        );
+    }
+    if s.colors.len() < 2 {
+        return None;
+    }
+    let colors: Vec<skia_safe::Color4f> = s
+        .colors
+        .iter()
+        .map(|c| {
+            let cf = [
+                c.first().copied().unwrap_or(0.0),
+                c.get(1).copied().unwrap_or(0.0),
+                c.get(2).copied().unwrap_or(0.0),
+                c.get(3).copied().unwrap_or(1.0),
+            ];
+            let [r, g, b, a] = normalized_color(cf);
+            skia_safe::Color4f::new(r, g, b, a)
+        })
+        .collect();
+    let positions = if s.positions.len() == colors.len() {
+        Some(s.positions.as_slice())
+    } else {
+        None
+    };
+    // ponytail: g-canvaskit paints gradients with TileMode.Mirror; keep in sync.
+    let tile = TileMode::Mirror;
+    let pos: Option<&[f32]> = if s.positions.len() == colors.len() {
+        Some(&s.positions)
+    } else {
+        None
+    };
+    match s.kind.as_str() {
+        "linear" if s.start.len() >= 2 && s.end.len() >= 2 => Shader::linear_gradient(
+            (
+                Point::new(s.start[0], s.start[1]),
+                Point::new(s.end[0], s.end[1]),
+            ),
+            &colors[..],
+            pos,
+            tile,
+            None,
+            None,
+        ),
+        "radial" if s.center.len() >= 2 && s.radius.is_some() => {
+            let radius = s.radius.unwrap_or(1.0);
+            if radius <= 0.0 {
+                return None;
+            }
+            Shader::radial_gradient(
+                Point::new(s.center[0], s.center[1]),
+                radius,
+                &colors[..],
+                pos,
+                tile,
+                None,
+                None,
+            )
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -518,31 +785,45 @@ fn resolve_paint(
     meta: Option<&CommandMeta>,
     default_preference: PaintPreference,
 ) -> Result<Option<Paint>, G2ReplayError> {
-    if let Some(primary) = primary {
-        if let Some(paint) = build_paint(primary)? {
-            return Ok(Some(paint));
-        }
-    }
-
-    let preference = primary
-        .and_then(|paint| infer_preference_from_snapshot(paint))
-        .or_else(|| meta.and_then(infer_preference_from_meta))
-        .unwrap_or(default_preference);
-
-    if let Some(meta) = meta {
-        for snapshot in fallback_paint_snapshots(meta, preference) {
-            if let Some(paint) = build_paint(snapshot)? {
-                return Ok(Some(paint));
-            }
-        }
-        if let Some(snapshot) = source_style_paint_snapshot(meta, preference) {
+    let Some(primary) = primary else {
+        // ponytail: null paint = g-canvaskit skipped its setters (lineWidth<=0).
+        // g-canvas still strokes these with defaults (wind arrows), so resurrect
+        // STROKES from the source display object. Never resurrect fills — the
+        // fill pass is captured separately and resurrecting double-draws it.
+        let Some(meta) = meta else {
+            return Ok(None);
+        };
+        if let Some(snapshot) = source_style_paint_snapshot(meta, PaintPreference::Stroke) {
             if let Some(paint) = build_paint(&snapshot)? {
                 return Ok(Some(paint));
             }
         }
-    }
+        return Ok(None);
+    };
+    match build_paint(primary)? {
+        Some(paint) => Ok(Some(paint)),
+        // unsupported paint features (shader/maskFilter): approximate from source styles
+        None => {
+            let preference = infer_preference_from_snapshot(primary)
+                .or_else(|| meta.and_then(infer_preference_from_meta))
+                .unwrap_or(default_preference);
 
-    Ok(None)
+            if let Some(meta) = meta {
+                for snapshot in fallback_paint_snapshots(meta, preference) {
+                    if let Some(paint) = build_paint(snapshot)? {
+                        return Ok(Some(paint));
+                    }
+                }
+                if let Some(snapshot) = source_style_paint_snapshot(meta, preference) {
+                    if let Some(paint) = build_paint(&snapshot)? {
+                        return Ok(Some(paint));
+                    }
+                }
+            }
+
+            Ok(None)
+        }
+    }
 }
 
 fn infer_preference_from_snapshot(snapshot: &PaintSnapshot) -> Option<PaintPreference> {
@@ -869,11 +1150,20 @@ impl TextRenderer {
             "rtl" => TextDirection::RTL,
             _ => TextDirection::LTR,
         });
-        paragraph_style.set_text_align(match text_align {
-            "center" | "middle" => TextAlign::Center,
-            "right" | "end" => TextAlign::Right,
-            _ => TextAlign::Left,
-        });
+        // g-canvaskit lays each paragraph out at its measured text width, so the
+        // captured x already encodes the alignment; re-applying alignment over a
+        // different layout width shifts text (center/right labels off by half a
+        // glyph run). Single-line text: align left, layout unconstrained.
+        let single_line = !text.contains('\n') && max_lines.map(|m| m <= 1).unwrap_or(true);
+        if single_line {
+            paragraph_style.set_text_align(TextAlign::Left);
+        } else {
+            paragraph_style.set_text_align(match text_align {
+                "center" | "middle" => TextAlign::Center,
+                "right" | "end" => TextAlign::Right,
+                _ => TextAlign::Left,
+            });
+        }
         if let Some(max_lines) = max_lines.filter(|value| *value > 0) {
             paragraph_style.set_max_lines(Some(max_lines));
         }
@@ -885,7 +1175,11 @@ impl TextRenderer {
         builder.push_style(&text_style);
         builder.add_text(text);
         let mut paragraph = builder.build();
-        paragraph.layout(width.max(1.0));
+        if single_line {
+            paragraph.layout(f32::INFINITY);
+        } else {
+            paragraph.layout(width.max(1.0));
+        }
         paragraph.paint(canvas, Point::new(x, y));
         Ok(())
     }
@@ -907,6 +1201,51 @@ fn default_text_direction() -> String {
     "ltr".into()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gradient_paint_draws() {
+        let paint_json = r#"{"style":"fill","color":null,"alpha":0.85,"shader":{"kind":"linear","colors":[[1,1,1,1],[0,0.3921568691730499,0,1]],"positions":[0,1],"start":[436.297,485],"end":[436.297,-2.84e-14]},"hasShader":true}"#;
+        let paint: PaintSnapshot = serde_json::from_str(paint_json).unwrap();
+        let scene = G2Scene {
+            width: 100,
+            height: 100,
+            commands: vec![G2CanvasCommand::DrawRect {
+                meta: CommandMeta::default(),
+                rect: vec![0.0, 0.0, 100.0, 100.0],
+                paint: Some(paint),
+            }],
+        };
+        let png = render_scene_to_png(&scene).unwrap();
+        assert!(png.starts_with(&[0x89, b'P', b'N', b'G']));
+    }
+
+    #[test]
+    fn replay_rect_to_png() {
+        let scene = G2Scene {
+            width: 100,
+            height: 50,
+            layers: vec![SceneLayer {
+                x: 0.0,
+                y: 0.0,
+                commands: vec![G2CanvasCommand::DrawRect {
+                    meta: CommandMeta::default(),
+                    rect: vec![10.0, 10.0, 90.0, 40.0],
+                    paint: Some(PaintSnapshot {
+                        style: Some("fill".into()),
+                        color: Some([1.0, 0.0, 0.0, 1.0]),
+                        ..Default::default()
+                    }),
+                }],
+            }],
+        };
+        let png = render_scene_to_png(&scene).unwrap();
+        assert!(png.starts_with(&[0x89, b'P', b'N', b'G']));
+    }
+}
+
 impl DisplayObjectSnapshot {
     fn fill_snapshot(&self) -> Option<PaintSnapshot> {
         let color = source_color_to_rgba(self.fill.as_ref()?)?;
@@ -925,9 +1264,11 @@ impl DisplayObjectSnapshot {
             stroke_join: self.line_join.clone(),
             stroke_miter: None,
             alpha: None,
+            shader: None,
             has_shader: false,
             has_path_effect: false,
             has_mask_filter: false,
+            mask_filter: None,
             path_effect: None,
         })
     }
@@ -954,28 +1295,54 @@ impl DisplayObjectSnapshot {
             stroke_join: self.line_join.clone(),
             stroke_miter: None,
             alpha: None,
+            shader: None,
             has_shader: false,
             has_path_effect: false,
             has_mask_filter: false,
+            mask_filter: None,
             path_effect: None,
         })
     }
 }
 
-fn source_color_to_rgba(source: &SourceColorSnapshot) -> Option<[f32; 4]> {
+fn source_color_to_rgba(source: &Value) -> Option<[f32; 4]> {
     match source {
-        SourceColorSnapshot::Object(color) => {
-            if color.is_none.unwrap_or(false) {
+        Value::Object(color) => {
+            if color.get("isNone").and_then(Value::as_bool).unwrap_or(false) {
                 return None;
             }
-            let r = color.r?.clamp(0.0, 255.0) / 255.0;
-            let g = color.g?.clamp(0.0, 255.0) / 255.0;
-            let b = color.b?.clamp(0.0, 255.0) / 255.0;
-            let a = color.alpha.unwrap_or(1.0).clamp(0.0, 1.0);
+            // ponytail: gradients land here too and have no r/g/b; we skip them.
+            let channel = |key: &str| -> Option<f32> {
+                color.get(key).and_then(Value::as_f64).map(|v| v as f32)
+            };
+            let r = channel("r")?.clamp(0.0, 255.0) / 255.0;
+            let g = channel("g")?.clamp(0.0, 255.0) / 255.0;
+            let b = channel("b")?.clamp(0.0, 255.0) / 255.0;
+            let a = color
+                .get("alpha")
+                .and_then(Value::as_f64)
+                .map(|v| v as f32)
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0);
             Some([r, g, b, a])
         }
-        SourceColorSnapshot::Array(color) => Some(normalized_color(*color)),
-        SourceColorSnapshot::Text(text) => parse_named_source_color(text),
+        Value::Array(values) => {
+            let nums: Vec<f32> = values
+                .iter()
+                .filter_map(|v| v.as_f64().map(|v| v as f32))
+                .collect();
+            // ponytail: non-numeric arrays are gradient stops; skip until shaders exist.
+            if nums.is_empty() || nums.len() != values.len() {
+                return None;
+            }
+            let mut c = [0.0, 0.0, 0.0, 1.0];
+            for (i, v) in nums.iter().take(4).enumerate() {
+                c[i] = *v;
+            }
+            Some(normalized_color(c))
+        }
+        Value::String(text) => parse_named_source_color(text),
+        _ => None,
     }
 }
 
