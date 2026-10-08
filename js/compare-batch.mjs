@@ -1,6 +1,6 @@
 // Batch: run every G2 gallery example through Edge (truth) and g2-rs, pixel-diff.
 // Usage: bun compare-batch.mjs [filter-substring]   e.g. bun compare-batch.mjs general/
-import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, rmSync, statSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
@@ -150,15 +150,51 @@ try {
 </script></body></html>`;
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function runEdge(htmlPath, shotPath, profileDir) {
-  await execFileP(EDGE, [
+  // msedge's launcher process exits immediately (~0.1s) and the real browser
+  // writes the screenshot a second-plus later — awaiting process exit races
+  // pixelDiff against the screenshot write (stale/wrong-page diffs), and
+  // headless instances linger afterwards, hijacking later launches via the
+  // --user-data-dir singleton. Wait for the file to land, then kill every
+  // process carrying this invocation's unique profile tag.
+  const profile = `${profileDir}-${Math.random().toString(36).slice(2, 10)}`;
+  rmSync(shotPath, { force: true });
+  const launch = execFileP(EDGE, [
     "--headless=new", "--disable-gpu", "--no-first-run", "--disable-extensions",
-    `--user-data-dir=${profileDir}`,
+    `--user-data-dir=${profile}`,
     `--window-size=${WIDTH},${HEIGHT}`,
       `--screenshot=${shotPath}`,
       `--virtual-time-budget=${VIRTUAL_TIME_BUDGET}`,
       pathToFileURL(htmlPath).href,
-    ], { timeout: TIMEOUT_MS, stdio: "ignore" });
+    ], { timeout: TIMEOUT_MS, stdio: "ignore" }).catch(() => {});
+  const deadline = Date.now() + TIMEOUT_MS;
+  let lastMtime = 0;
+  try {
+    while (Date.now() < deadline) {
+      if (existsSync(shotPath)) {
+        const mtime = statSync(shotPath).mtimeMs;
+        if (mtime !== lastMtime) {
+          lastMtime = mtime;
+          await sleep(200);
+          continue;
+        }
+        break;
+      }
+      await sleep(100);
+    }
+    if (!existsSync(shotPath)) {
+      throw new Error(`edge screenshot never landed: ${shotPath}`);
+    }
+  } finally {
+    await execFileP("powershell", [
+      "-NoProfile", "-Command",
+      `Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" | Where-Object { $_.CommandLine -like '*${profile}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`,
+    ], { timeout: 30_000 }).catch(() => {});
+    rmSync(profile, { recursive: true, force: true });
+    await launch;
+  }
 }
 
 async function runG2rs(examplePath, name) {
@@ -185,12 +221,18 @@ function pixelDiff(aPath, bPath) {
   return { diffPct: +((diffPixels / total) * 100).toFixed(2), meanDelta: +(sumDelta / total).toFixed(2) };
 }
 
+let jobSeq = 0;
+
 async function checkOne(job, slot) {
   const name = job.id.replaceAll("/", "-");
-  const htmlPath = resolve(ART, `_${slot}.html`);
+  // Unique per-invocation file names: Edge renders asynchronously, so a
+  // slot-shared html could be overwritten by the next job before the browser
+  // actually reads it (screenshots of the wrong demo).
+  const uniq = `${slot}-${process.pid}-${jobSeq++}`;
+  const htmlPath = resolve(ART, `_${uniq}.html`);
   const shotPath = resolve(ART, `${name}-chrome.png`);
   // Same transpiled source on both sides: Bun TS->JS for the browser harness AND g2-rs.
-  const transpiledPath = resolve(ART, `_${slot}-transpiled.js`);
+  const transpiledPath = resolve(ART, `_${uniq}-transpiled.js`);
   const rec = { id: job.id };
   try {
     const js = SEEDED_RANDOM_PRELUDE + transpileExample(readFileSync(job.file, "utf8"));
@@ -208,6 +250,9 @@ async function checkOne(job, slot) {
   } catch (error) {
     const stderr = String(error.stderr || "").trim();
     rec.error = String(error.message || error).slice(0, 200) + (stderr ? " | " + stderr.slice(0, 300) : "");
+  } finally {
+    rmSync(htmlPath, { force: true });
+    rmSync(transpiledPath, { force: true });
   }
   return rec;
 }

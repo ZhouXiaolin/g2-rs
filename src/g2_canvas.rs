@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use serde_json::Value;
+use skia_safe::gradient::{Colors, Gradient, Interpolation, shaders};
 use skia_safe::{
     paint, path_builder, surfaces, Color, EncodedImageFormat, FilterMode, FontMgr, Matrix,
     MipmapMode, Paint, PathBuilder, PathDirection, PathEffect, Point, RRect, Rect, SamplingOptions,
@@ -483,7 +484,8 @@ fn replay_command(
         }
         G2CanvasCommand::DrawPath { meta, path, paint } => {
             if let Some(path) = build_path(path) {
-            if let Some(paint) = resolve_paint(paint.as_ref(), Some(meta), PaintPreference::Auto)? {
+                if let Some(paint) = resolve_paint(paint.as_ref(), Some(meta), PaintPreference::Auto)?
+                {
                     canvas.draw_path(&path, &paint);
                 }
             }
@@ -502,7 +504,7 @@ fn replay_command(
         }
         G2CanvasCommand::DrawCircle { meta, cx, cy, r, paint } => {
             if let Some(paint) = resolve_paint(paint.as_ref(), Some(meta), PaintPreference::Auto)? {
-                    canvas.draw_circle((*cx, *cy), *r, &paint);
+                canvas.draw_circle((*cx, *cy), *r, &paint);
             }
         }
         G2CanvasCommand::DrawOval { meta, rect, paint } => {
@@ -736,22 +738,15 @@ fn build_shader(shader: Option<&ShaderSnapshot>) -> Option<Shader> {
         None
     };
     // ponytail: g-canvaskit paints gradients with TileMode.Mirror; keep in sync.
-    let tile = TileMode::Mirror;
-    let pos: Option<&[f32]> = if s.positions.len() == colors.len() {
-        Some(&s.positions)
-    } else {
-        None
-    };
+    let gradient_colors = Colors::new(&colors, positions, TileMode::Mirror, None);
+    let gradient = Gradient::new(gradient_colors, Interpolation::default());
     match s.kind.as_str() {
-        "linear" if s.start.len() >= 2 && s.end.len() >= 2 => Shader::linear_gradient(
+        "linear" if s.start.len() >= 2 && s.end.len() >= 2 => shaders::linear_gradient(
             (
                 Point::new(s.start[0], s.start[1]),
                 Point::new(s.end[0], s.end[1]),
             ),
-            &colors[..],
-            pos,
-            tile,
-            None,
+            &gradient,
             None,
         ),
         "radial" if s.center.len() >= 2 && s.radius.is_some() => {
@@ -759,13 +754,9 @@ fn build_shader(shader: Option<&ShaderSnapshot>) -> Option<Shader> {
             if radius <= 0.0 {
                 return None;
             }
-            Shader::radial_gradient(
-                Point::new(s.center[0], s.center[1]),
-                radius,
-                &colors[..],
-                pos,
-                tile,
-                None,
+            shaders::radial_gradient(
+                (Point::new(s.center[0], s.center[1]), radius),
+                &gradient,
                 None,
             )
         }
@@ -1212,10 +1203,16 @@ mod tests {
         let scene = G2Scene {
             width: 100,
             height: 100,
-            commands: vec![G2CanvasCommand::DrawRect {
-                meta: CommandMeta::default(),
-                rect: vec![0.0, 0.0, 100.0, 100.0],
-                paint: Some(paint),
+            layers: vec![SceneLayer {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+                commands: vec![G2CanvasCommand::DrawRect {
+                    meta: CommandMeta::default(),
+                    rect: vec![0.0, 0.0, 100.0, 100.0],
+                    paint: Some(paint),
+                }],
             }],
         };
         let png = render_scene_to_png(&scene).unwrap();
@@ -1230,6 +1227,8 @@ mod tests {
             layers: vec![SceneLayer {
                 x: 0.0,
                 y: 0.0,
+                width: 100.0,
+                height: 50.0,
                 commands: vec![G2CanvasCommand::DrawRect {
                     meta: CommandMeta::default(),
                     rect: vec![10.0, 10.0, 90.0, 40.0],

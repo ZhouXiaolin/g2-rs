@@ -13,7 +13,6 @@ use skia_safe::font_style::{Slant, Weight, Width};
 use skia_safe::{Font, FontMgr, FontStyle};
 
 const G2_HOST_RUNTIME: &str = include_str!("g2_host_runtime.js");
-const DEFAULT_G2_SCRIPT: &str = include_str!("../examples/g2-stacked-area.js");
 
 #[derive(Debug, Clone)]
 pub struct ProbeLog {
@@ -95,10 +94,6 @@ impl G2Probe {
             context,
             logs,
         })
-    }
-
-    pub fn run_sample_chart(&self) -> Result<G2ProbeReport, G2ProbeError> {
-        self.run_script(DEFAULT_G2_SCRIPT, &G2RunOptions::default())
     }
 
     pub fn run_script(
@@ -363,22 +358,35 @@ fn eval_string(ctx: &rquickjs::Ctx<'_>, script: &str) -> Option<String> {
     ctx.eval::<String, _>(script).ok()
 }
 
+/// Shared agent: ureq 3's top-level `ureq::get()` creates a use-once agent per
+/// call, so image-heavy demos pay a fresh TCP+TLS handshake per fetch (~55s for
+/// the contributor demo vs <45s batch timeout). One agent keeps connections hot.
+fn http_agent() -> &'static ureq::Agent {
+    use std::sync::OnceLock;
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(ureq::Agent::new_with_defaults)
+}
+
 fn fetch_text(url: &str) -> Result<String, String> {
-    let response = ureq::get(url)
+    let mut response = http_agent()
+        .get(url)
         .call()
         .map_err(|error| format!("fetch failed for {url}: {error}"))?;
     response
-        .into_string()
+        .body_mut()
+        .read_to_string()
         .map_err(|error| format!("failed to read response body for {url}: {error}"))
 }
 
 fn fetch_base64(url: &str) -> Result<String, String> {
     use base64::Engine as _;
-    let response = ureq::get(url)
+    let response = http_agent()
+        .get(url)
         .call()
         .map_err(|error| format!("fetch failed for {url}: {error}"))?;
     let mut bytes = Vec::new();
     response
+        .into_body()
         .into_reader()
         .read_to_end(&mut bytes)
         .map_err(|error| format!("failed to read response body for {url}: {error}"))?;
@@ -454,7 +462,7 @@ fn encode_png(rgba: &str, width: u32, height: u32) -> Result<String, String> {
     let image = images::raster_from_data(&info, skia_safe::Data::new_copy(&bytes), info.min_row_bytes())
         .ok_or("failed to build raster image")?;
     let png = image
-        .encode_to_data(skia_safe::EncodedImageFormat::PNG)
+        .encode(None, skia_safe::EncodedImageFormat::PNG, None)
         .ok_or("png encode failed")?;
     Ok(base64::engine::general_purpose::STANDARD.encode(png.as_bytes()))
 }
@@ -554,7 +562,7 @@ fn draw_text(
     }
     let mut surface =
         surfaces::raster(&info, None, None).ok_or_else(|| "failed to create surface".to_string())?;
-    surface
+    let _ = surface
         .canvas()
         .write_pixels(&info, &bytes, info.min_row_bytes(), (0, 0));
 
@@ -620,7 +628,7 @@ fn default_stroke_opacity() -> f64 {
 /// antialiased by skia like the browser baseline. Returns straight-RGBA base64.
 fn rasterize_pattern(args: &str) -> Result<String, String> {
     use base64::Engine as _;
-    use skia_safe::{surfaces, AlphaType, Color, ColorType, Paint, PaintStyle};
+    use skia_safe::{surfaces, AlphaType, ColorType, Paint, PaintStyle};
     let parsed: PatternArgs =
         serde_json::from_str(args).map_err(|error| format!("bad pattern args: {error}"))?;
     let width = parsed.width.max(1);
@@ -792,7 +800,7 @@ fn pick_typeface(font_mgr: &FontMgr, font_families: &str, style: FontStyle) -> O
     None
 }
 
-pub(crate) fn generic_candidates(family: &str) -> Option<&'static [&'static str]> {
+fn generic_candidates(family: &str) -> Option<&'static [&'static str]> {
     match family.to_ascii_lowercase().as_str() {
         // ponytail: headless Edge resolves sans-serif to the platform UI metric
         // family (Segoe UI on this machine); this order matched its measureText

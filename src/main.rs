@@ -7,7 +7,7 @@ use std::{
 use g2_rs::{render_scene_to_png, scene_from_json, G2Probe, G2RunOptions, ProbeLog};
 
 struct Cli {
-    input: Option<String>,
+    input: String,
     output_dir: PathBuf,
     width: u32,
     height: u32,
@@ -31,7 +31,7 @@ fn run_cli() {
         std::process::exit(2);
     });
 
-    let script = read_script(&cli).unwrap_or_else(|error| {
+    let script = read_script(&cli.input).unwrap_or_else(|error| {
         eprintln!("Failed to read G2 script: {error}");
         std::process::exit(1);
     });
@@ -103,14 +103,12 @@ fn run_cli() {
 }
 
 fn parse_args() -> Result<Cli, String> {
-    let mut cli = Cli {
-        input: None,
-        output_dir: PathBuf::from("artifacts"),
-        width: 960,
-        height: 540,
-        container_id: "container".into(),
-        name: None,
-    };
+    let mut input: Option<String> = None;
+    let mut output_dir = PathBuf::from("artifacts");
+    let mut width = 960;
+    let mut height = 540;
+    let mut container_id = "container".to_string();
+    let mut name: Option<String> = None;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -120,38 +118,38 @@ fn parse_args() -> Result<Cli, String> {
                 std::process::exit(0);
             }
             "-i" | "--input" => {
-                cli.input = Some(
+                input = Some(
                     args.next()
                         .ok_or_else(|| "missing value for --input".to_string())?,
                 );
             }
             "-o" | "--output-dir" => {
-                cli.output_dir = PathBuf::from(
+                output_dir = PathBuf::from(
                     args.next()
                         .ok_or_else(|| "missing value for --output-dir".to_string())?,
                 );
             }
             "--width" => {
-                cli.width = parse_u32_arg(
+                width = parse_u32_arg(
                     &args.next()
                         .ok_or_else(|| "missing value for --width".to_string())?,
                     "--width",
                 )?;
             }
             "--height" => {
-                cli.height = parse_u32_arg(
+                height = parse_u32_arg(
                     &args.next()
                         .ok_or_else(|| "missing value for --height".to_string())?,
                     "--height",
                 )?;
             }
             "--container-id" => {
-                cli.container_id = args
+                container_id = args
                     .next()
                     .ok_or_else(|| "missing value for --container-id".to_string())?;
             }
             "--name" => {
-                cli.name = Some(
+                name = Some(
                     args.next()
                         .ok_or_else(|| "missing value for --name".to_string())?,
                 );
@@ -160,18 +158,28 @@ fn parse_args() -> Result<Cli, String> {
                 return Err(format!("unknown argument: {value}\n\n{}", help_text()));
             }
             value => {
-                if cli.input.is_some() {
+                if input.is_some() {
                     return Err(format!(
                         "unexpected positional argument: {value}\n\n{}",
                         help_text()
                     ));
                 }
-                cli.input = Some(value.to_string());
+                input = Some(value.to_string());
             }
         }
     }
 
-    Ok(cli)
+    Ok(Cli {
+        input: input.ok_or_else(|| {
+            "missing required script path: --input FILE ('-' reads stdin)\n\n".to_string()
+                + &help_text()
+        })?,
+        output_dir,
+        width,
+        height,
+        container_id,
+        name,
+    })
 }
 
 fn parse_u32_arg(value: &str, name: &str) -> Result<u32, String> {
@@ -187,34 +195,33 @@ fn print_help() {
 fn help_text() -> String {
     [
         "Usage:",
-        "  cargo run -- [--input FILE|-] [--output-dir DIR] [--width PX] [--height PX] [--container-id ID] [--name STEM]",
+        "  g2-rs --input FILE|- [--output-dir DIR] [--width PX] [--height PX] [--container-id ID] [--name STEM]",
+        "",
+        "Options:",
+        "  -i, --input FILE      G2 demo script (plain JS); '-' reads from stdin",
+        "  -o, --output-dir DIR  output directory (default: artifacts)",
+        "  --width PX            canvas width (default: 960)",
+        "  --height PX           canvas height (default: 540)",
+        "  --container-id ID     container element id (default: container)",
+        "  --name STEM           output file stem (default: input file stem)",
         "",
         "Examples:",
-        "  cargo run -- --input examples/g2-aapl-candlestick.js --name aapl",
-        "  Get-Content examples/g2-aapl-candlestick.js | cargo run -- --input - --name aapl",
-        "",
-        "Defaults:",
-        "  --input omitted: built-in stacked area example",
-        "  --output-dir artifacts",
-        "  --width 960",
-        "  --height 540",
-        "  --container-id container",
+        "  g2-rs --input examples/column-maxwidth.js",
+        "  Get-Content examples/column-maxwidth.js | g2-rs --input - --name column-maxwidth",
     ]
     .join("\n")
 }
 
-fn read_script(cli: &Cli) -> Result<String, String> {
-    match cli.input.as_deref() {
-        None => fs::read_to_string(PathBuf::from("examples").join("g2-stacked-area.js"))
-            .map_err(|e| e.to_string()),
-        Some("-") => {
+fn read_script(input: &str) -> Result<String, String> {
+    match input {
+        "-" => {
             let mut buffer = String::new();
             io::stdin()
                 .read_to_string(&mut buffer)
                 .map_err(|e| e.to_string())?;
             Ok(buffer)
         }
-        Some(path) => fs::read_to_string(path).map_err(|e| e.to_string()),
+        path => fs::read_to_string(path).map_err(|e| e.to_string()),
     }
 }
 
@@ -222,13 +229,11 @@ fn output_stem(cli: &Cli) -> String {
     if let Some(name) = cli.name.as_deref() {
         return sanitize_stem(name);
     }
-    if let Some(input) = cli.input.as_deref() {
-        if input == "-" {
-            return "stdin".into();
-        }
-        if let Some(stem) = Path::new(input).file_stem().and_then(|v| v.to_str()) {
-            return sanitize_stem(stem);
-        }
+    if cli.input == "-" {
+        return "stdin".into();
+    }
+    if let Some(stem) = Path::new(&cli.input).file_stem().and_then(|v| v.to_str()) {
+        return sanitize_stem(stem);
     }
     "g2".into()
 }
